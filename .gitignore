@@ -1,0 +1,13 @@
+# 备份与临时产物（脚本运行时写在 ~/.dsh/rescue/，不在仓库里）
+backups/
+*.log
+
+# Windows / macOS 噪声
+Thumbs.db
+Desktop.ini
+.DS_Store
+.idea/
+.vscode/
+
+# 测试用副本
+_test/
