@@ -2,7 +2,7 @@
 
 DSH 桌面端起不来时用它：**先判断是哪一类故障，再走对应的那一条路**。修的是 profile 配置层，不碰会话、附件、记忆、锚点、凭据。
 
-**当前版本：v1.4.0**
+**当前版本：v1.5.0**
 
 ---
 
@@ -76,6 +76,7 @@ dsh-rescue diagnose
 | `Cannot read properties of undefined (reading '...')`，栈在 `dsh-desktop-host` | **乙类** 依赖树 | `dsh-rescue restore -Snapshot <上一个良好快照>` |
 | `desktop welcome: Web authentication failed` | **丙类** 主进程握手 | **先看日志里有没有 `host diagnostic` 段**，见下节 |
 | `Unexpected token '﻿'` / `is not valid JSON`，栈在 `readProfileManifest` | **丁类** 文件编码 | `dsh-rescue strip-bom` |
+| `... only the launching environment may set ...`，栈在 `readEnvLayer` | **戊类** `.env` 越权 | `dsh-rescue fix-env` |
 | 都不像 | 未知 | `dsh-rescue snapshot` 保底，把日志那一段发人看 |
 
 **这四类的修法互斥。** 用错一条不但无效，还会顺手把插件配置清掉。
@@ -175,6 +176,27 @@ dsh-rescue strip-bom
 
 **根治**：改这几个文件用 `pwsh`，或者显式指定 `-Encoding utf8NoBOM`。
 
+### 戊类：`.env` 里写了越权的键
+
+```
+DesktopHostFatalError: dsh: C:\Users\<你>\.dsh\.env sets "SOME_KEY", which only the
+launching environment may set ...; export SOME_KEY instead of putting it in a .env file
+    at readEnvLayer (... dsh-app-boot/lib/index.js:4468)
+```
+
+- **坏在哪**：`~/.dsh/.env`。这个文件里的键**不是**随便写的——宿主对其中一部分做白名单校验，因为那些键"决定进程怎么启动、代码和指令从哪加载、怎么联网"。
+- **典型起因**：想给某个插件加一个开关，图省事写进 `.env`，结果整个应用起不来（连插件层都没到）。
+- **判据**：报错里点名了键；`diagnose` 会把它打出来。
+- **命令**（应用完全退出）：
+
+```powershell
+dsh-rescue fix-env      # 从 .env 删掉日志点名的那一行，先自动备份
+```
+
+> 真要用这个开关，用**启动环境**：`$env:SOME_KEY = '1'`，然后在同一个窗口启动应用。这正是宿主在报错里说的 `export` 的意思。
+>
+> **代理三件套（`HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`）是允许的**，别一起删了。
+
 ---
 
 ## 命令
@@ -190,10 +212,14 @@ dsh-rescue strip-bom
 | `dsh-rescue rollback` | 列出所有快照，挑一份写回 | 是 |
 | `dsh-rescue reset-cookies` | 丙类用：把 Cookies 改名（可回退） | 是 |
 | `dsh-rescue strip-bom` | 丁类用：去掉配置文件开头的 BOM | 是（只减 3 字节） |
+| `dsh-rescue fix-env` | 戊类用：从 `~/.dsh/.env` 删掉宿主不允许的键（先备份） | 是 |
+| `dsh-rescue snapshots` | 列快照（依赖数 / 是否带 BOM / 有没有补丁） | 否 |
 | `dsh-rescue install` | 把短命令写进 PowerShell profile | 是（只改 profile） |
 | `dsh-rescue help` | 用法 | 否 |
 
 参数：`-Snapshot <名字>`（restore / rollback 选哪份快照）、`-ProfileDir <路径>`（默认 `~/.dsh/profiles/desktop`）、`-Force`（应用在跑也继续，不推荐）。
+
+> **`-Snapshot` 后面必须带名字。** 只打 `dsh-rescue restore -Snapshot` 会报"参数缺少自变量"——而且那条报错会指向你的 profile 文件，看起来像脚本坏了。不知道名字就先 `dsh-rescue snapshots`。
 
 ---
 
@@ -208,6 +234,7 @@ dsh-rescue strip-bom
 | 用 `link:` 把本地包接进 profile，或**手工覆盖 `node_modules` 里的文件** | 乙类故障的典型起因；要改本地包用 `pnpm patch`，或只在独立测试 profile 里试 |
 | 用 PowerShell 5.1 的 `Set-Content -Encoding UTF8` 改 profile 配置 | 会写 BOM，宿主 `JSON.parse` 直接失败（丁类）；改用 `pwsh` 或 `-Encoding utf8NoBOM` |
 | 让任何脚本去改 profile 的 `package.json`（加 `patchedDependencies`、改 bundles、改依赖） | 2026-11-11 那次就是这么崩的：脚本用 PS 5.1 写回 `package.json` → 带 BOM → 启动即死。**profile 的清单只允许 `dsh-rescue` 改，或人工在 `pwsh` 里改** |
+| 把"只允许启动环境设置"的键写进 `~/.dsh/.env` | 宿主启动时会**直接拒绝**（戊类）：`export X instead of putting it in a .env file`。2026-11-12 我就是这么把它弄崩的 |
 | 把"pnpm 说 Done / 依赖都在位"当成"应用能用" | 安装成功 ≠ 启动成功。**只有重启进得去主界面才算验证** |
 
 **判断口诀**：`diagnose` 说甲类才碰配置；说乙类只碰依赖；说丙类先看 `host diagnostic`；说丁类只碰文件编码；说不认识就只做 `snapshot`。
@@ -274,6 +301,8 @@ dsh-rescue restore         # 装回依赖
 dsh-rescue rollback        # 回退（会列快照）
 dsh-rescue reset-cookies   # 丙类
 dsh-rescue strip-bom       # 丁类
+dsh-rescue fix-env         # 戊类
+dsh-rescue snapshots       # 挑快照用
 ```
 
 没装短命令时，把 `dsh-rescue xxx` 换成：

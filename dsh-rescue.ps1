@@ -28,7 +28,7 @@
 param(
   [Parameter(Position = 0)]
   [ValidateSet('status', 'diagnose', 'snapshot', 'minimal', 'restore', 'rollback',
-               'reset-cookies', 'strip-bom', 'install', 'verify', 'guide', 'help')]
+               'reset-cookies', 'strip-bom', 'fix-env', 'snapshots', 'install', 'verify', 'guide', 'help')]
   [string]$Command = '',
 
   [string]$ProfileDir = '',
@@ -309,6 +309,7 @@ function Get-FaultClass {
   param([string]$ErrLine, [bool]$HasHostDiag)
   if ([string]::IsNullOrWhiteSpace($ErrLine)) { return '?' }
   if ($ErrLine -match 'did not activate') { return '甲' }
+  if ($ErrLine -match 'only the launching environment may set|readEnvLayer') { return '戊' }
   if ($ErrLine -match 'readProfileManifest|is not valid JSON|Unexpected token') { return '丁' }
   if ($ErrLine -match 'authenticatedUrl|dsh-desktop-host') { return '乙' }
   if ($ErrLine -match 'Web authentication failed|connectDesktopWelcome') {
@@ -526,6 +527,21 @@ function Show-Diagnose {
     Say '    pwsh -File dsh-rescue.ps1 strip-bom'
     Say '  解析还是失败就退回上一份良好快照：restore -Snapshot <名字>'
     Say '  提醒：PowerShell 5.1 的 Set-Content -Encoding UTF8 会写 BOM，别用它改这些文件。'
+  }
+  elseif ($cls -eq '戊') {
+    # 戊类：.env 里写了只允许启动环境设置的键
+    Say '  戊类故障：~/.dsh/.env 里写了"只允许启动环境设置"的键，宿主启动时直接拒绝。'
+    Say '  报错原文会说 "export X instead of putting it in a .env file"。'
+    $k = Get-EnvFileKey
+    if ($k) {
+      Bad "  键名：$k"
+      Say ''
+      Say '  处置（应用要完全退出）：'
+      Say '    dsh-rescue fix-env        （从 .env 删掉这行，先自动备份）'
+      Say "  真要用这个开关，改成启动前设置：`$env:$k = '1'，再在同一窗口启动应用。"
+    } else {
+      Say '  没从日志里认出键名，人工检查 ~/.dsh/.env 里的非代理键。'
+    }
   }
   else {
     Say '  错误类型没有命中已知模式。先 snapshot 保底，再人工看日志里第一段 --- error ---。'
@@ -909,6 +925,10 @@ function Invoke-Guide {
       $why = '日志里没有 host diagnostic：宿主根本没起来，main 把"连不上宿主"包装成了登录失败。先别删 Cookies，先回退依赖树。'
       if (-not $best) { Bad '  没有可用的良好快照，先 snapshot。'; return }
     }
+    '戊' {
+      $plan = 'fix-env'
+      $why = '~/.dsh/.env 里写了只允许启动环境设置的键，宿主启动时直接拒绝。删掉那行即可。'
+    }
     '丁' {
       $plan = 'strip-bom'
       $why = '配置文件开头有 UTF-8 BOM，宿主 JSON.parse 直接失败。只减 3 字节，不动内容。'
@@ -948,6 +968,7 @@ function Invoke-Guide {
     'minimal'       { Invoke-Minimal }
     'restore'       { Invoke-Restore }
     'strip-bom'     { Invoke-StripBom }
+    'fix-env'       { Invoke-FixEnv }
     'reset-cookies' { Invoke-ResetCookies }
   'verify'        { Invoke-Verify }
     'snapshot'      { $d = New-Snapshot -Reason 'guide'; Ok "已备份：$d" }
@@ -959,6 +980,66 @@ function Invoke-Guide {
   Say "  2) $after"
   if ($crash.Class -eq '甲') { Say '  3) 起来之后跑：dsh-rescue restore' }
   Say ''
+}
+
+# ---------------- fix-env（.env 里写了不允许的键） ----------------
+function Get-EnvFileKey {
+  $c = Get-CrashFacts
+  if (-not $c) { return $null }
+  if ($c.ErrLine -match 'sets\s+"([A-Za-z0-9_]+)"') { return $Matches[1] }
+  return $null
+}
+
+function Invoke-FixEnv {
+  Assert-AppClosed
+  $envPath = Join-Path $HomeDir '.dsh\.env'
+  if (-not (Test-Path $envPath)) { Warn ".env 不存在（$envPath），无需处理"; return }
+
+  $key = Get-EnvFileKey
+  if (-not $key) {
+    Warn '没能从崩溃日志里认出是哪个键。下面是非代理行，人工看一眼：'
+    Get-Content $envPath | Where-Object { $_ -match '^\s*[A-Za-z_][A-Za-z0-9_]*\s*=' } | ForEach-Object { Say "  $_" }
+    Say '  宿主只允许启动环境设置某些键；把它们从 .env 删掉，改成启动前 $env:KEY=''1''。'
+    return
+  }
+
+  Step ".env：$envPath"
+  Say "  崩溃日志指认的键：$key"
+  $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+  Copy-Item $envPath "$envPath.bak-$stamp" -Force
+  $lines = @(Get-Content $envPath)
+  $kept = @($lines | Where-Object { $_ -notmatch ('^\s*' + [regex]::Escape($key) + '\s*=') })
+  if ($kept.Count -eq $lines.Count) { Warn "没找到 $key= 这一行（可能已被删过）"; return }
+
+  [System.IO.File]::WriteAllLines($envPath, $kept, (New-Object System.Text.UTF8Encoding($false)))
+  Ok "已删除 $($lines.Count - $kept.Count) 行（备份：.env.bak-$stamp）"
+  Say ''
+  Say '下一步：启动 DeepSeek Harness 验证。' -ForegroundColor Yellow
+  Say "要这个开关就改成启动前设置：`$env:$key = '1'，再在同一窗口启动应用。" -ForegroundColor Yellow
+}
+
+# ---------------- snapshots（列快照，挑一个用） ----------------
+function Invoke-ListSnapshots {
+  $snaps = @(Get-Snapshots)
+  if ($snaps.Count -eq 0) { Warn '还没有任何快照。先跑 dsh-rescue snapshot'; return }
+  Step "共 $($snaps.Count) 份（新 → 旧）"
+  foreach ($s in $snaps) {
+    $pkg = Join-Path $s.FullName 'package.json'
+    $deps = 0; $bom = $false
+    if (Test-Path $pkg) {
+      $by = [System.IO.File]::ReadAllBytes($pkg)
+      $bom = ($by.Length -ge 3 -and $by[0] -eq 0xEF -and $by[1] -eq 0xBB -and $by[2] -eq 0xBF)
+      try {
+        $deps = @(([System.Text.Encoding]::UTF8.GetString($by).TrimStart([char]0xFEFF) | ConvertFrom-Json).dependencies.PSObject.Properties).Count
+      } catch { }
+    }
+    $wsPath = Join-Path $s.FullName 'pnpm-workspace.yaml'
+    $patched = (Test-Path $wsPath) -and [bool](Select-String -Path $wsPath -Pattern 'patchedDependencies' -Quiet)
+    $flag = if ($bom) { '  ← 带 BOM，别用' } elseif ($deps -eq 0) { '  ← 空配置' } else { '' }
+    Say ("  {0}  deps={1,-2} 补丁={2,-6}{3}" -f $s.Name, $deps, $patched, $flag)
+  }
+  Say ''
+  Say '用法：dsh-rescue restore -Snapshot <名字>'
 }
 
 # ---------------- 分发 ----------------
@@ -976,11 +1057,14 @@ DSH 急救 · dsh-rescue
   rollback       把快照写回（默认最近一份，会列出所有快照）
   reset-cookies  丙类用：登录态坏了，把 Cookies 改名（不删除，可回退）
   strip-bom      丁类用：配置文件带 UTF-8 BOM 时去掉它
+  fix-env        戊类用：从 ~/.dsh/.env 删掉宿主不允许的键（先备份）
+  snapshots      列出所有快照（依赖数 / 是否带 BOM / 有没有补丁）
   install        把短命令 dsh-rescue 写进 PowerShell profile
 
 参数：
   -ProfileDir <路径>   默认 ~/.dsh/profiles/desktop
   -Snapshot <名字>     restore / rollback 时指定用哪份快照
+                       不知道名字就先跑 dsh-rescue snapshots
   -AppDataDir <路径>   默认 %APPDATA%\@deepseek-ai\dsh-desktop
   -Force               应用在运行中也继续（不推荐）
 
@@ -1006,5 +1090,7 @@ switch ($Command) {
   'verify'        { Invoke-Verify }
   'guide'         { Invoke-Guide }
   'strip-bom'     { Invoke-StripBom }
+  'fix-env'       { Invoke-FixEnv }
+  'snapshots'     { Invoke-ListSnapshots }
   'install'       { Invoke-Install }
 }
