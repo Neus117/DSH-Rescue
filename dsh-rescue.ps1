@@ -33,6 +33,7 @@ param(
 
   [string]$ProfileDir = '',
 
+  [Parameter(Position = 1)]
   [string]$Snapshot = '',
 
   # 仅用于测试：把“应用数据目录”指到别处，避免动到真实 Cookies
@@ -209,7 +210,14 @@ function New-Snapshot {
     $src = Join-Path $ProfileDir $f
     if (Test-Path $src) { Copy-Item $src (Join-Path $dir $f) -Force; $n++ }
   }
-  @{ reason = $Reason; at = (Get-Date).ToString('o'); files = $n } |
+  # patches/ 必须一起收：workspace 里的 patchedDependencies 指向这里的文件
+  $patchDir = Join-Path $ProfileDir 'patches'
+  $patchCount = 0
+  if (Test-Path $patchDir) {
+    Copy-Item $patchDir (Join-Path $dir 'patches') -Recurse -Force -ErrorAction SilentlyContinue
+    $patchCount = @(Get-ChildItem (Join-Path $dir 'patches') -File -ErrorAction SilentlyContinue).Count
+  }
+  @{ reason = $Reason; at = (Get-Date).ToString('o'); files = $n; patches = $patchCount } |
     ConvertTo-Json | Set-Content (Join-Path $dir 'meta.json') -Encoding utf8NoBOM
 
   # 只留最近 N 份
@@ -557,6 +565,16 @@ function Show-Diagnose {
   Say ""
 }
 
+function Assert-JsonParses {
+  param([string]$Path, [string]$What)
+  try {
+    $raw = Get-Content $Path -Raw -ErrorAction Stop
+    [void]($raw | ConvertFrom-Json)
+  } catch {
+    throw "$What 写入后不是合法 JSON（$Path）。用 dsh-rescue rollback 退回。"
+  }
+}
+
 # ---------------- minimal ----------------
 function Invoke-Minimal {
   Assert-AppClosed
@@ -571,6 +589,7 @@ function Invoke-Minimal {
   }
   $json = $minimal | ConvertTo-Json -Depth 6
   Write-TextAtomic -Path (Join-Path $ProfileDir 'package.json') -Text $json
+  Assert-JsonParses -Path (Join-Path  'package.json') -What 'minimal 的 package.json'
 
   # patch 层退回纯注释的空数组，避免引用没装的插件
   $patch = @'
@@ -649,6 +668,7 @@ function Invoke-Restore {
     if (Install-ConfigFile -From $ws -To (Join-Path $ProfileDir 'pnpm-workspace.yaml')) { $stripped += 'pnpm-workspace.yaml' }
   }
   Ok 'package.json 已还原'
+  Assert-JsonParses -Path (Join-Path $ProfileDir 'package.json') -What '还原的 package.json'
   if ($stripped.Count -gt 0) { Warn ('源文件带 BOM，已去掉：' + ($stripped -join ', ')) }
 
   # 有 lockfile 就一起还原：锁定成当时能跑的那棵树，避免 ^ 解析出更新的版本
@@ -670,6 +690,20 @@ function Invoke-Restore {
     Warn '没有可用的 patch 备份，保留当前 patch'
   }
 
+  # workspace 引用补丁时，必须保证 patch 文件在，否则 pnpm 会报 ERR_PNPM_PATCH_NOT_FOUND
+  $wsPath = Join-Path $ProfileDir 'pnpm-workspace.yaml'
+  if ((Test-Path $wsPath) -and (Select-String -Path $wsPath -Pattern 'patchedDependencies' -Quiet)) {
+    $livePatches = Join-Path $ProfileDir 'patches'
+    if (-not (Test-Path $livePatches) -and (Test-Path (Join-Path $srcDir 'patches'))) {
+      Copy-Item (Join-Path $srcDir 'patches') $livePatches -Recurse -Force
+      Ok '已从快照补回 patches/'
+    }
+    $missingPatch = @(Get-ChildItem $livePatches -Filter '*.patch' -File -ErrorAction SilentlyContinue).Count -lt 1
+    if ($missingPatch) {
+      throw "这份快照的 pnpm-workspace.yaml 引用了补丁，但 patches/ 里没有 .patch 文件。先补回补丁，或改用一份不含 patchedDependencies 的快照。"
+    }
+  }
+
   $rt = Find-Runtime
   if (-not $rt.Pnpm -or -not $rt.Node) { throw "找不到内嵌 pnpm/node（pnpm=$($rt.Pnpm) node=$($rt.Node)）" }
 
@@ -677,6 +711,11 @@ function Invoke-Restore {
   $pnpmArgs = if ($frozen) { @('install', '--frozen-lockfile') } else { @('install') }
   $run = Invoke-Pnpm -Node $rt.Node -Pnpm $rt.Pnpm -Dir $ProfileDir -PnpmArgs $pnpmArgs
   if ($run.TimedOut) { throw "pnpm install 超过 180 秒，已杀进程树。日志：$($run.Log)" }
+  if ($run.Code -ne 0 -and $frozen) {
+    Warn '冻结安装失败（快照里的 lockfile 与 package.json 可能不匹配），改用不冻结重试一次'
+    $run = Invoke-Pnpm -Node $rt.Node -Pnpm $rt.Pnpm -Dir $ProfileDir -PnpmArgs @('install')
+  }
+  if ($run.TimedOut) { throw "pnpm install 超时（180 秒，已杀进程树）。日志：$($run.Log)" }
   if ($run.Code -ne 0) { throw "pnpm install 失败（退出码 $($run.Code)）。日志：$($run.Log)" }
   Ok '依赖安装完成'
 
@@ -907,6 +946,7 @@ function Invoke-Guide {
   # 每类给"做什么 + 为什么 + 做完看什么"
   $plan = $null
   $snapName = $null
+  $reportPath = $null
   $why = $null
   $after = '启动应用，能进主界面就回来跑 dsh-rescue verify'
 
@@ -946,7 +986,7 @@ function Invoke-Guide {
       if ($best) { $script:Snapshot = $best; $snapName = $best }
       $why = '没命中已知类型。这种情况最可能是配置层的残局，所以先回退到最近的良好快照；现场已写进报告，事后可查。'
       $after = '启动应用；还不起来就 dsh-rescue rollback'
-      $script:GuideReport = Save-DiagnosisReport
+      $reportPath = Save-DiagnosisReport
     }
   }
 
@@ -954,7 +994,7 @@ function Invoke-Guide {
   Step '3/3 建议'
   Say "  打算做：$plan$(if ($snapName) { " -Snapshot $snapName" })"
   Say "  为什么：$why"
-  Say "  做完看：$after"
+  Say "  做完看：$after"`n  if ($reportPath) { Say "  现场报告：$reportPath" }
 
   if ($plan -ne 'snapshot' -and (Test-AppRunning) -and -not $Force) {
     Say ''
@@ -1045,8 +1085,11 @@ function Invoke-ListSnapshots {
     }
     $wsPath = Join-Path $s.FullName 'pnpm-workspace.yaml'
     $patched = (Test-Path $wsPath) -and [bool](Select-String -Path $wsPath -Pattern 'patchedDependencies' -Quiet)
+    $reason = '?'
+    $meta = Join-Path $s.FullName 'meta.json'
+    if (Test-Path $meta) { try { $reason = (Get-Content $meta -Raw | ConvertFrom-Json).reason } catch { } }
     $flag = if ($bom) { '  ← 带 BOM，别用' } elseif ($deps -eq 0) { '  ← 空配置' } else { '' }
-    Say ("  {0}  deps={1,-2} 补丁={2,-6}{3}" -f $s.Name, $deps, $patched, $flag)
+    Say ("  {0}  deps={1,-2} 补丁={2,-6} {3,-14}{4}" -f $s.Name, $deps, $patched, $reason, $flag)
   }
   Say ''
   Say '用法：dsh-rescue restore -Snapshot <名字>'
@@ -1143,6 +1186,7 @@ DSH 急救 · dsh-rescue
   -ProfileDir <路径>   默认 ~/.dsh/profiles/desktop
   -Snapshot <名字>     restore / rollback 时指定用哪份快照
                        不知道名字就先跑 dsh-rescue snapshots
+                       也可以省掉 -Snapshot 直接写名字：restore auto-20260101-120000
   -AppDataDir <路径>   默认 %APPDATA%\@deepseek-ai\dsh-desktop
   -Force               应用在运行中也继续（不推荐）
 
