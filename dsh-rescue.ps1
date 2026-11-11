@@ -66,41 +66,50 @@ $AppDataRoot = if ([string]::IsNullOrWhiteSpace($AppDataDir)) {
 
 function Get-CookieFiles {
   if (-not (Test-Path $AppDataRoot)) { return @() }
-  @(Get-ChildItem $AppDataRoot -File -Filter 'Cookies*' -ErrorAction SilentlyContinue)
+  # 现代 Chromium 把登录取在 Network\Cookies，不在顶层；递归找，别只扫根目录
+  @(Get-ChildItem $AppDataRoot -Recurse -File -Filter 'Cookies*' -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -in @('Cookies', 'Cookies-journal') })
 }
 
 # 判定 Cookies 是否可读：0 字节、非 SQLite 头、残留非空 journal 都算坏
+# 注意：Chromium 可能有多份（顶层 + Network + Partitions/*），逐份判，坏一份就报
 function Get-CookieReport {
   $files = @(Get-CookieFiles)
   if ($files.Count -eq 0) {
     return [pscustomobject]@{ Exists = $false; Bad = $false; Detail = '没有 Cookies 文件（下次启动会重新登录）' }
   }
-  $main = $files | Where-Object { $_.Name -eq 'Cookies' } | Select-Object -First 1
-  $journal = $files | Where-Object { $_.Name -eq 'Cookies-journal' } | Select-Object -First 1
-  $detail = (@($files | ForEach-Object { "$($_.Name)=$($_.Length)B" }) -join '  ')
-
+  $rel = { param($p) $p.FullName.Substring($AppDataRoot.Length).TrimStart('\') }
   $bad = $false
-  $why = ''
-  if ($main) {
-    if ($main.Length -eq 0) { $bad = $true; $why = 'Cookies 是 0 字节' }
-    else {
+  $whys = @()
+  $notes = @()
+
+  foreach ($f in $files) {
+    $name = & $rel $f
+    if ($f.Name -eq 'Cookies') {
+      if ($f.Length -eq 0) { $bad = $true; $whys += "$name 是 0 字节" ; continue }
       try {
-        $fs = [System.IO.File]::Open($main.FullName, 'Open', 'Read', 'ReadWrite')
+        $fs = [System.IO.File]::Open($f.FullName, 'Open', 'Read', 'ReadWrite')
         try {
           $buf = New-Object byte[] 15
           [void]$fs.Read($buf, 0, 15)
           if ([System.Text.Encoding]::ASCII.GetString($buf) -ne 'SQLite format 3') {
-            $bad = $true; $why = 'Cookies 不是 SQLite 文件头'
+            $bad = $true; $whys += "$name 不是 SQLite 文件头"
           }
         } finally { $fs.Dispose() }
-      } catch { $why = 'Cookies 打不开（被占用或权限问题）' }
+      } catch {
+        # 应用在运行时独占锁这个库，打不开属正常，不能据此判坏
+        $notes += "$name 读取被占用（应用在运行，正常）"
+      }
+    }
+    elseif ($f.Name -eq 'Cookies-journal' -and $f.Length -gt 0) {
+      $bad = $true; $whys += "$name 残留 $($f.Length)B（上次写到一半）"
     }
   }
-  if (-not $bad -and $journal -and $journal.Length -gt 0) {
-    $bad = $true; $why = '残留非空 Cookies-journal（上次写到一半）'
-  }
-  $final = if ([string]::IsNullOrWhiteSpace($why)) { $detail } else { "$detail   ← $why" }
-  [pscustomobject]@{ Exists = $true; Bad = $bad; Detail = $final }
+
+  $detail = (@($files | ForEach-Object { "$(& $rel $_)=$($_.Length)B" }) -join '  ')
+  if ($whys.Count -gt 0) { $detail = "$detail   ← " + ($whys -join '；') }
+  elseif ($notes.Count -gt 0) { $detail = "$detail   （$($notes -join '；')）" }
+  [pscustomobject]@{ Exists = $true; Bad = $bad; Detail = $detail }
 }
 
 
@@ -213,6 +222,40 @@ function New-Snapshot {
   return $dir
 }
 
+# ---------------- 原子写（先写临时文件再改名，避免"写一半进程没了"） ----------------
+function Write-TextAtomic {
+  param([string]$Path, [string]$Text)
+  $tmp = "$Path.tmp-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+  Set-Content -Path $tmp -Value $Text -Encoding utf8NoBOM -NoNewline
+  Move-Item -Path $tmp -Destination $Path -Force
+}
+
+function Copy-FileAtomic {
+  param([string]$From, [string]$To)
+  $tmp = "$To.tmp-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+  Copy-Item -Path $From -Destination $tmp -Force
+  Move-Item -Path $tmp -Destination $To -Force
+}
+
+# ---------------- pnpm：硬超时 + 超时杀进程树 ----------------
+function Invoke-Pnpm {
+  param([string]$Node, [string]$Pnpm, [string]$Dir, [string[]]$PnpmArgs, [int]$TimeoutSec = 180)
+  $tag = [guid]::NewGuid().ToString('N').Substring(0, 8)
+  $out = Join-Path $env:TEMP "dsh-rescue-pnpm-$tag.log"
+  $err = "$out.err"
+  $all = @($Pnpm) + $PnpmArgs + @('--reporter=append-only')
+
+  $proc = Start-Process -FilePath $Node -ArgumentList $all -WorkingDirectory $Dir `
+    -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+
+  if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+    & taskkill /F /T /PID $proc.Id 2>$null | Out-Null
+    return [pscustomobject]@{ Code = 124; Log = $out; TimedOut = $true }
+  }
+  $proc.Refresh()
+  return [pscustomobject]@{ Code = $proc.ExitCode; Log = $out; TimedOut = $false }
+}
+
 # ---------------- status ----------------
 function Show-Status {
   $json = Read-ProfileJson
@@ -318,6 +361,7 @@ function Show-Diagnose {
   }
 
   $head = @(Get-Content $latest.FullName -TotalCount 400)
+  $hasHostDiag = [bool](Select-String -Path $latest.FullName -Pattern 'host diagnostic' -Quiet -ErrorAction SilentlyContinue)
 
   # 取 --- error --- 后面第一行非空内容：这是唯一能用来分型的依据
   $errLine = ''
@@ -367,25 +411,28 @@ function Show-Diagnose {
     Say '    4) 在问题查清前，别往 profile 里再装 link: 依赖'
   }
   elseif ($errText -match 'Web authentication failed' -or $errText -match 'connectDesktopWelcome') {
-    # 丙类：登录态坏了 —— 与 profile 无关，别动配置
-    Say '  丙类故障：应用登录态失效（desktop welcome: Web authentication failed）。'
-    Say '  这跟插件、profile 配置、node_modules 一点关系都没有，动它们只会白丢配置。'
-    Say '  真凶是应用数据目录里的 Cookies（Electron 的登录态 SQLite）。'
-    $ck = Get-CookieReport
-    Say ("  当前 Cookies：$($ck.Detail)")
-    if ($ck.Bad) { Bad '  ← 已经能看出它坏了' }
+    # 丙类：主进程在登录取证阶段失败。两种可能，先证后修。
+    Say '  丙类故障：主进程在 welcome / 登录握手阶段失败（Web authentication failed）。'
     Say ''
-    Say '  正确做法（应用要完全退出，含托盘）：'
-    Say '    pwsh -File dsh-rescue.ps1 reset-cookies'
-    Say '  这条会把 Cookies / Cookies-journal 改名成 .bak-时间戳（不是删除，可回退），'
-    Say '  然后重启应用，重新登录一次即可。'
+    $ck = Get-CookieReport
+    Say ("  Cookies：$($ck.Detail)")
+    if ($hasHostDiag) {
+      Say '  日志里有 host diagnostic 段 → 宿主跑起来了，问题在登录态。'
+      Say '  处置：让应用完全退出，然后 pwsh -File dsh-rescue.ps1 reset-cookies；重启后重新登录。'
+    } else {
+      Say '  日志里**没有** host diagnostic 段 → 宿主子进程根本没报告。'
+      Say '  这种情况下 main 进程会把"连不上宿主"包装成登录失败，真凶更可能是插件/依赖树，'
+      Say '  而不是 Cookies。**先别删 Cookies**，按下面顺序试：'
+      Say '    1) pwsh -File dsh-rescue.ps1 restore -Snapshot <上一个良好快照>'
+      Say '    2) 若你手工改过 node_modules（覆盖文件 / link / 手装包），先删 node_modules 再来一次'
+      Say '    3) 前两步都无效，才考虑 reset-cookies'
+    }
   }
   else {
     Say '  错误类型没有命中已知模式。先 snapshot 保底，再人工看日志里第一段 --- error ---。'
   }
   Say ""
 }
-
 # ---------------- minimal ----------------
 function Invoke-Minimal {
   Assert-AppClosed
@@ -399,7 +446,7 @@ function Invoke-Minimal {
     dsh            = @{ profile = @{ bundles = @('@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app') } }
   }
   $json = $minimal | ConvertTo-Json -Depth 6
-  Set-Content (Join-Path $ProfileDir 'package.json') $json -Encoding utf8NoBOM
+  Write-TextAtomic -Path (Join-Path $ProfileDir 'package.json') -Text $json
 
   # patch 层退回纯注释的空数组，避免引用没装的插件
   $patch = @'
@@ -407,7 +454,7 @@ function Invoke-Minimal {
 # 原配置已备份到 ~/.dsh/rescue/backups/，用 restore 或 rollback 取回。
 []
 '@
-  Set-Content (Join-Path $ProfileDir 'cordis.patch.yml') $patch -Encoding utf8NoBOM
+  Write-TextAtomic -Path (Join-Path $ProfileDir 'cordis.patch.yml') -Text $patch
 
   Ok '已写入最小配置（bundles 只留 base + web-app，依赖清空，patch 清空）'
   Warn 'node_modules 没删——它不参与 bundle 层决议，留着不影响启动'
@@ -471,16 +518,16 @@ function Invoke-Restore {
   Ok "已备份当前配置：$snap"
 
   Step "还原依赖清单：$($depSource.FullName)"
-  Copy-Item $depSource.FullName (Join-Path $ProfileDir 'package.json') -Force
+  Copy-FileAtomic -From $depSource.FullName -To (Join-Path $ProfileDir 'package.json')
   $ws = Join-Path $srcDir 'pnpm-workspace.yaml'
-  if (Test-Path $ws) { Copy-Item $ws (Join-Path $ProfileDir 'pnpm-workspace.yaml') -Force }
+  if (Test-Path $ws) { Copy-FileAtomic -From $ws -To (Join-Path $ProfileDir 'pnpm-workspace.yaml') }
   Ok 'package.json 已还原'
 
   # 有 lockfile 就一起还原：锁定成当时能跑的那棵树，避免 ^ 解析出更新的版本
   $frozen = $false
   $lf = Join-Path $srcDir 'pnpm-lock.yaml'
   if (Test-Path $lf) {
-    Copy-Item $lf (Join-Path $ProfileDir 'pnpm-lock.yaml') -Force
+    Copy-FileAtomic -From $lf -To (Join-Path $ProfileDir 'pnpm-lock.yaml')
     $frozen = $true
     Ok 'pnpm-lock.yaml 已还原（将按它冻结安装）'
   } else {
@@ -489,7 +536,7 @@ function Invoke-Restore {
 
   if ($patchSource) {
     Step "还原 patch：$($patchSource.Name)"
-    Copy-Item $patchSource.FullName (Join-Path $ProfileDir 'cordis.patch.yml') -Force
+    Copy-FileAtomic -From $patchSource.FullName -To (Join-Path $ProfileDir 'cordis.patch.yml')
     Ok 'cordis.patch.yml 已还原'
   } else {
     Warn '没有可用的 patch 备份，保留当前 patch'
@@ -498,14 +545,12 @@ function Invoke-Restore {
   $rt = Find-Runtime
   if (-not $rt.Pnpm -or -not $rt.Node) { throw "找不到内嵌 pnpm/node（pnpm=$($rt.Pnpm) node=$($rt.Node)）" }
 
-  Step '安装依赖（可能要 20~60 秒）'
-  Push-Location $ProfileDir
-  try {
-    if ($frozen) { & $rt.Node $rt.Pnpm install --frozen-lockfile --reporter=append-only }
-    else { & $rt.Node $rt.Pnpm install --reporter=append-only }
-  } finally { Pop-Location }
-  $code = $LASTEXITCODE
-  if ($code -ne 0) { throw "pnpm install 失败（退出码 $code）。配置已改但依赖没装好，可用 rollback 退回。" }
+  Step '安装依赖（硬超时 180 秒，超时杀进程树）'
+  $pnpmArgs = if ($frozen) { @('install', '--frozen-lockfile') } else { @('install') }
+  $run = Invoke-Pnpm -Node $rt.Node -Pnpm $rt.Pnpm -Dir $ProfileDir -PnpmArgs $pnpmArgs
+  if ($run.TimedOut) { throw "pnpm install 超过 180 秒，已杀进程树。日志：$($run.Log)" }
+  if ($run.Code -ne 0) { throw "pnpm install 失败（退出码 $($run.Code)）。日志：$($run.Log)" }
+  Ok '依赖安装完成'
 
   $json = Read-ProfileJson
   $deps = @(Get-DepNames $json)

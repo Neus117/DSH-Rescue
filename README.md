@@ -2,7 +2,7 @@
 
 DSH 桌面端起不来时用它：**先判断是哪一类故障，再走对应的那一条路**。修的是 profile 配置层，不碰会话、附件、记忆、锚点、凭据。
 
-**当前版本：v1.1.0**
+**当前版本：v1.2.0**
 
 ---
 
@@ -40,10 +40,10 @@ dsh-rescue diagnose
 |---|---|---|
 | `... required plugins did not activate` | **甲类** 装载树 | `dsh-rescue minimal` → 启动确认 → `dsh-rescue restore` |
 | `Cannot read properties of undefined (reading '...')`，栈在 `dsh-desktop-host` | **乙类** 依赖树 | `dsh-rescue restore -Snapshot <上一个良好快照>` |
-| `desktop welcome: Web authentication failed` | **丙类** 登录态 | `dsh-rescue reset-cookies` |
+| `desktop welcome: Web authentication failed` | **丙类** 主进程握手 | **先看日志里有没有 `host diagnostic` 段**，见下节 |
 | 都不像 | 未知 | `dsh-rescue snapshot` 保底，把日志那一段发人看 |
 
-**这三类的修法互斥。** 用错一条不但无效，还会顺手把插件配置清掉。下表写清了三类各自"坏在哪、该动什么"。
+**这三类的修法互斥。** 用错一条不但无效，还会顺手把插件配置清掉。
 
 ---
 
@@ -86,24 +86,37 @@ Remove-Item -Recurse -Force "$env:USERPROFILE\.dsh\profiles\desktop\node_modules
 dsh-rescue restore -Snapshot <上一个良好快照>
 ```
 
-### 丙类：登录态坏了
+### 丙类：主进程在 welcome / 登录握手阶段失败
 
 ```
 Error: desktop welcome: Web authentication failed
     at connectDesktopWelcome (... app.asar/lib/main.js:16856)
 ```
 
-- **坏在哪**：应用数据目录里的 `Cookies`（Electron 的登录态 SQLite）。**和 profile、插件、node_modules 全都无关。**
-- **典型起因**：Cookies 被写坏——0 字节、文件头不是 SQLite、或者旁边留着一个非空的 `Cookies-journal`（上次写到一半）。
-- **要动**：只动 Cookies 这两个文件。
-- **命令**（应用要完全退出，含托盘）：
+这一类**有两个完全不同的原因**，而且症状一模一样。判据只有一条：**日志里有没有 `host diagnostic (as reported by the Host process)` 这一段。**
+
+| 有没有 host diagnostic | 说明 | 该怎么办 |
+|---|---|---|
+| **有** | 宿主子进程跑起来了并报了错 → 问题在登录态 | `dsh-rescue reset-cookies`，重启后重新登录 |
+| **没有** | 宿主根本没报告 → main 进程把"连不上宿主"包装成了登录失败，真凶在插件/依赖树 | **先别删 Cookies**，按 1→3 试 |
+
+"没有 host diagnostic"时的顺序（代价从小到大）：
 
 ```powershell
+# 1. 回退到上一个良好快照
+dsh-rescue restore -Snapshot <上一个良好快照>
+# 2. 若你手工改过 node_modules（覆盖文件 / link / 手装包），删掉再来一次
+Remove-Item -Recurse -Force "$env:USERPROFILE\.dsh\profiles\desktop\node_modules"
+dsh-rescue restore -Snapshot <上一个良好快照>
+# 3. 前两步都无效，才动 Cookies
 dsh-rescue reset-cookies
-# 然后启动应用，重新登录一次
 ```
 
-它把 `Cookies` / `Cookies-journal` **改名**成 `.bak-时间戳`，不是删除——要退回把名字改回来就行。
+> **v1.1.0 曾把这里写成"一定是 Cookies 坏了"，那是错的。** 2026-11-11 那次事故里，崩溃前 4 分钟有人把 73 个 fork 文件覆盖进了 `node_modules/dsh-pet`，而日志里没有 host diagnostic——更可能是宿主启动即死。当时删 Cookies 只是**恰好**也一并解决了问题（因为同时删了 `node_modules`、把配置退成了最小）。判据只看 `host diagnostic` 在不在，不看"删了之后好了"。
+
+Cookies 的真实位置：`%APPDATA%\@deepseek-ai\dsh-desktop\Network\Cookies`（Chromium 的新布局），不在顶层。工具是**递归**找的，顶层和 `Partitions\*` 里的也会一起处理。
+
+`reset-cookies` 只是**改名**成 `.bak-时间戳`，不是删除；要退回把名字改回来。
 
 ---
 
@@ -159,6 +172,17 @@ dsh-rescue reset-cookies
 - `rollback` 会先列出所有快照（时间 / 原因 / 依赖数）供你挑，不是只能退回上一步。
 - 快照里带 `pnpm-lock.yaml` 时按它冻结安装。
 - pnpm / node 从 `~/.dsh/dsh-runtimes` 现找，不写死路径。
+
+## 健壮性（v1.2.0 加固）
+
+| 加固 | 为什么 |
+|---|---|
+| 配置**原子写**（写临时文件再改名） | 之前的事故里有两次是"操作写到一半进程没了"。"写到一半"的配置文件是最难救的状态，原子写让它不可能出现 |
+| `pnpm install` **硬超时 180 秒 + 超时杀进程树** | 卡住的安装会让人干等；`taskkill /F /T` 才杀得干净（只杀父进程会留下孤儿占着 node_modules） |
+| Cookies 判定**递归**、坏一份就报 | Chromium 把登录取在 `Network\Cookies`，只扫顶层会漏；`Partitions\*` 下也可能有 |
+| Cookies **被占用不算坏** | 应用在运行时独占锁 SQLite 是正常状态，之前会误报成"打不开" |
+| `diagnose` 不再靠关键词白名单 | 改成直接取 `--- error ---` 后面第一行——白名单每遇到新故障就漏一次（v1.0 和 v1.1 各漏一次） |
+| `diagnose` 先看 `host diagnostic` 在不在 | 丙类的两个原因症状完全一样，这是唯一能区分的结构信号 |
 
 ## 已知限制
 
