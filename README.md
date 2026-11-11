@@ -2,7 +2,7 @@
 
 DSH 桌面端起不来时用它：**先判断是哪一类故障，再走对应的那一条路**。修的是 profile 配置层，不碰会话、附件、记忆、锚点、凭据。
 
-**当前版本：v1.3.0**
+**当前版本：v1.4.0**
 
 ---
 
@@ -28,7 +28,41 @@ dsh-rescue status
 
 ---
 
-## 出事了先做这一件事（30 秒）
+## 出事了：跑一条命令，跟着它走
+
+```powershell
+dsh-rescue
+```
+
+不带参数就是**向导**。它自己看现状、读崩溃日志、判断类型，然后告诉你：
+
+```
+» 1/3 现状
+  插件依赖    : 8 个（node_modules 里 113 个顶层包）
+  patch 条目  : 7
+  文件编码    : 正常（无 BOM）
+  应用进程    : 未运行
+
+» 2/3 判断
+  最新崩溃：11/11/2026 16:06:04
+  错误行  ：DesktopHostFatalError: Unexpected token '﻿', "﻿{
+  类型    ：丁 类
+
+» 3/3 建议
+  打算做：strip-bom
+  为什么：配置文件开头有 UTF-8 BOM，宿主 JSON.parse 直接失败。只减 3 字节，不动内容。
+  做完看：启动应用，能进主界面就回来跑 dsh-rescue verify
+
+现在执行 strip-bom 吗？ [Y/n]
+```
+
+- 它**问过你才动手**；你说 n，它只把该抄的命令打出来。
+- 应用还在运行、而这一步必须关掉应用时，它**不会执行**，只会让你先退出——不会硬来。
+- 修完重启应用，再跑 `dsh-rescue verify` 核对是不是真的好了。
+
+**这三步就是全部**：`dsh-rescue` → 重启 → `dsh-rescue verify`。下面的内容都是这三步的展开与兜底。
+
+## 不想走向导：直接看判断
 
 ```powershell
 dsh-rescue diagnose
@@ -147,8 +181,9 @@ dsh-rescue strip-bom
 
 | 命令 | 做什么 | 会改文件 |
 |---|---|---|
-| `dsh-rescue` | 不带参数：看现状（只读） | 否 |
-| `dsh-rescue diagnose` | 读最新崩溃日志 + 判定故障类型（只读） | 否 |
+| `dsh-rescue` | **不带参数：向导**（看现状 → 判类型 → 问过你再修） | 视情况 |
+| `dsh-rescue verify` | 修完重启后核对：真的好了还是又崩了 | 否 |
+| `dsh-rescue diagnose` | 只看判断（读最新崩溃日志 + 定类型） | 否 |
 | `dsh-rescue snapshot` | 手动留一个还原点 | 只写备份目录 |
 | `dsh-rescue minimal` | 甲类用：退到最小可启动配置 | 是 |
 | `dsh-rescue restore` | 装回良好依赖 + patch（有 lockfile 则冻结版本） | 是 |
@@ -172,6 +207,7 @@ dsh-rescue strip-bom
 | 手工删 `node_modules` / `pnpm-lock.yaml` / 把 patch 写成 `[]` | 和上一条一样：自伤，而且删了 lockfile 后 `^0.3.8` 可能解析出没验证过的新版本 |
 | 用 `link:` 把本地包接进 profile，或**手工覆盖 `node_modules` 里的文件** | 乙类故障的典型起因；要改本地包用 `pnpm patch`，或只在独立测试 profile 里试 |
 | 用 PowerShell 5.1 的 `Set-Content -Encoding UTF8` 改 profile 配置 | 会写 BOM，宿主 `JSON.parse` 直接失败（丁类）；改用 `pwsh` 或 `-Encoding utf8NoBOM` |
+| 让任何脚本去改 profile 的 `package.json`（加 `patchedDependencies`、改 bundles、改依赖） | 2026-11-11 那次就是这么崩的：脚本用 PS 5.1 写回 `package.json` → 带 BOM → 启动即死。**profile 的清单只允许 `dsh-rescue` 改，或人工在 `pwsh` 里改** |
 | 把"pnpm 说 Done / 依赖都在位"当成"应用能用" | 安装成功 ≠ 启动成功。**只有重启进得去主界面才算验证** |
 
 **判断口诀**：`diagnose` 说甲类才碰配置；说乙类只碰依赖；说丙类先看 `host diagnostic`；说丁类只碰文件编码；说不认识就只做 `snapshot`。
@@ -210,6 +246,8 @@ dsh-rescue strip-bom
 | `diagnose` 先看 `host diagnostic` 在不在 | 丙类的两个原因症状完全一样，这是唯一能区分的结构信号 |
 | **`restore` 装回去时自动去 BOM** | 快照可能本身就存着带 BOM 的 `package.json`；原样拷回等于复现崩溃 |
 | **去 BOM 走"读源→写目标"而不是"拷完再改"** | v1.2.0 那种写法在文件被占用时会**静默失败**，却照样报成功 |
+| **向导先判类型再动手，且必须你确认** | 前面几次事故的代价都来自"看错类型就动手"；向导把"做什么/为什么/做完看什么"一次讲清 |
+| **向导检测到应用在跑就不执行** | 在运行中改 profile 是前两次事故的共同前提 |
 
 ## 已知限制
 

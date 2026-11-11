@@ -28,7 +28,7 @@
 param(
   [Parameter(Position = 0)]
   [ValidateSet('status', 'diagnose', 'snapshot', 'minimal', 'restore', 'rollback',
-               'reset-cookies', 'strip-bom', 'install', 'help')]
+               'reset-cookies', 'strip-bom', 'install', 'verify', 'guide', 'help')]
   [string]$Command = '',
 
   [string]$ProfileDir = '',
@@ -304,6 +304,34 @@ function Invoke-Pnpm {
   return [pscustomobject]@{ Code = $proc.ExitCode; Log = $out; TimedOut = $false }
 }
 
+# ---------------- 故障分型：唯一判定入口（诊断与向导共用，避免两处逻辑分叉） ----------------
+function Get-FaultClass {
+  param([string]$ErrLine, [bool]$HasHostDiag)
+  if ([string]::IsNullOrWhiteSpace($ErrLine)) { return '?' }
+  if ($ErrLine -match 'did not activate') { return '甲' }
+  if ($ErrLine -match 'readProfileManifest|is not valid JSON|Unexpected token') { return '丁' }
+  if ($ErrLine -match 'authenticatedUrl|dsh-desktop-host') { return '乙' }
+  if ($ErrLine -match 'Web authentication failed|connectDesktopWelcome') {
+    if ($HasHostDiag) { return '丙' } else { return '丙-宿主' }
+  }
+  return '?'
+}
+
+# 最近一次"应用启动"的时间：Electron 启动会写 lockfile / Preferences
+function Get-AppStartTime {
+  $marks = @()
+  foreach ($n in @('lockfile', 'Preferences')) {
+    $p = Join-Path $AppDataRoot $n
+    if (Test-Path $p) { $marks += (Get-Item $p).LastWriteTime }
+  }
+  if ($marks.Count -eq 0) { return $null }
+  return ($marks | Sort-Object -Descending | Select-Object -First 1)
+}
+
+function Test-AppRunning {
+  [bool](Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue)
+}
+
 # ---------------- status ----------------
 function Show-Status {
   $json = Read-ProfileJson
@@ -438,8 +466,9 @@ function Show-Diagnose {
   Step '判断'
   $bundles = @(Get-Bundles $json)
   $errText = $errLine
+  $cls = Get-FaultClass -ErrLine $errText -HasHostDiag $hasHostDiag
 
-  if ($errText -match 'did not activate') {
+  if ($cls -eq '甲') {
     # 甲类：装载树没起来（基础 bundle 层未应用）
     if ($bundles -contains '@deepseek-ai/dsh-base') {
       Say '  甲类故障：必需插件没激活，通常是因为 dsh-base 的 bundle 层没被应用。'
@@ -449,7 +478,7 @@ function Show-Diagnose {
       Say '  甲类故障，且 bundles 里缺 dsh-base —— 直接 minimal 重建最小配置。'
     }
   }
-  elseif ($errText -match 'authenticatedUrl' -or $errText -match 'dsh-desktop-host') {
+  elseif ($cls -eq '乙') {
     # 乙类：Host 启动期读服务对象失败 —— 依赖树被污染，不是配置问题
     Say '  乙类故障：Host 在启动阶段读某个对象的字段失败（不是插件没激活）。'
     Say '  这类问题出在 node_modules 依赖树，不在 package.json / patch 那层配置上。'
@@ -463,7 +492,7 @@ function Show-Diagnose {
     Say '    3) 若仍失败：手动删 node_modules，再按良好 lockfile 重装'
     Say '    4) 在问题查清前，别往 profile 里再装 link: 依赖'
   }
-  elseif ($errText -match 'Web authentication failed' -or $errText -match 'connectDesktopWelcome') {
+  elseif ($cls -in @('丙','丙-宿主')) {
     # 丙类：主进程在登录取证阶段失败。两种可能，先证后修。
     Say '  丙类故障：主进程在 welcome / 登录握手阶段失败（Web authentication failed）。'
     Say ''
@@ -481,7 +510,7 @@ function Show-Diagnose {
       Say '    3) 前两步都无效，才考虑 reset-cookies'
     }
   }
-  elseif ($errText -match 'readProfileManifest|is not valid JSON|Unexpected token') {
+  elseif ($cls -eq '丁') {
     # 丁类：配置解析失败（BOM 或语法）
     Say '  丁类故障：配置文件解析失败（BOM 或 JSON/YAML 语法坏了）。'
     Say '  栈里的 readProfileManifest 说明宿主在读 profile 的 package.json 时就崩了，'
@@ -752,8 +781,188 @@ function Invoke-StripBom {
   Say '以后别在 PowerShell 5.1 里用 Set-Content -Encoding UTF8 改这些文件（会写 BOM）。' -ForegroundColor Yellow
 }
 
+# ---------------- 向导所需：读日志、挑快照、确认 ----------------
+function Get-CrashFacts {
+  $logs = @(Get-CrashLogs)
+  if ($logs.Count -eq 0) { return $null }
+  $latest = $logs[0]
+  $head = @(Get-Content $latest.FullName -TotalCount 400)
+  $err = ''
+  $mark = -1
+  for ($i = 0; $i -lt $head.Count; $i++) { if ($head[$i].Trim() -eq '--- error ---') { $mark = $i; break } }
+  if ($mark -ge 0) {
+    for ($i = $mark + 1; $i -lt $head.Count; $i++) { if ($head[$i].Trim()) { $err = $head[$i].Trim(); break } }
+  }
+  $hasDiag = [bool](Select-String -Path $latest.FullName -Pattern 'host diagnostic' -Quiet -ErrorAction SilentlyContinue)
+  [pscustomobject]@{
+    Path = $latest.FullName; When = $latest.LastWriteTime; ErrLine = $err
+    HasHostDiag = $hasDiag
+    Class = (Get-FaultClass -ErrLine $err -HasHostDiag $hasDiag)
+  }
+}
+
+# 最新一份"有依赖且不带 BOM"的快照——restore 的默认目标
+function Get-BestSnapshot {
+  foreach ($s in @(Get-Snapshots)) {
+    $p = Join-Path $s.FullName 'package.json'
+    if (-not (Test-Path $p)) { continue }
+    try {
+      $raw = [System.IO.File]::ReadAllBytes($p)
+      if ($raw.Length -ge 3 -and $raw[0] -eq 0xEF -and $raw[1] -eq 0xBB -and $raw[2] -eq 0xBF) { continue }
+      $j = [System.Text.Encoding]::UTF8.GetString($raw) | ConvertFrom-Json
+      if (@($j.dependencies.PSObject.Properties | ForEach-Object { $_.Name }).Count -gt 0) { return $s.Name }
+    } catch { }
+  }
+  return $null
+}
+
+function Confirm-Step {
+  param([string]$Question)
+  if ([Console]::IsInputRedirected) { return $false }
+  $ans = Read-Host "$Question [Y/n]"
+  return ($ans -eq '' -or $ans -match '^(y|yes|是)$')
+}
+
+function Show-Compact {
+  $json = Read-ProfileJson
+  $deps = @(Get-DepNames $json)
+  $nm = Join-Path $ProfileDir 'node_modules'
+  $installed = if (Test-Path $nm) { @(Get-ChildItem $nm -Directory -Force | Where-Object { $_.Name -notlike '.*' }).Count } else { 0 }
+  $bom = @(Get-BomCandidates | Where-Object { Test-BomFile $_.FullName })
+  Say "  插件依赖    : $($deps.Count) 个（node_modules 里 $installed 个顶层包）"
+  Say "  patch 条目  : $(@(Get-PatchIds).Count)"
+  Say ("  文件编码    : " + $(if ($bom.Count -gt 0) { "✘ $($bom[0].Name) 等 $($bom.Count) 个文件带 BOM" } else { '正常（无 BOM）' }))
+  Say "  应用进程    : $(if (Test-AppRunning) { '在运行' } else { '未运行' })"
+}
+
+# ---------------- verify ----------------
+function Invoke-Verify {
+  Say ''
+  Step '启动结果核对'
+  $start = Get-AppStartTime
+  $crash = Get-CrashFacts
+  $running = Test-AppRunning
+
+  Say ("  应用进程   : " + $(if ($running) { '在运行' } else { '未运行' }))
+  Say ("  最近启动   : " + $(if ($start) { $start } else { '查不到' }))
+  Say ("  最近崩溃   : " + $(if ($crash) { "$($crash.When)  ($($crash.Class) 类)" } else { '无日志' }))
+
+  if ($crash -and $start -and $crash.When -gt $start) {
+    Bad '  最近一次启动之后又崩了 —— 修复没生效，回去看上面那份日志的第一行错误。'
+  } elseif ($running) {
+    Ok '  应用在运行，且启动之后没有再产生崩溃日志。修复有效。'
+  } elseif ($start -and (-not $crash -or $crash.When -lt $start)) {
+    Warn '  最近一次启动看起来是成功的（之后没再崩溃），但应用现在没在运行。'
+  } else {
+    Warn '  判断不了：没有足够的启动/崩溃记录。'
+  }
+  Say ''
+}
+
+# ---------------- guide ----------------
+function Invoke-Guide {
+  Say ''
+  Say '=== DSH 急救向导 ===' -ForegroundColor White
+  Say ''
+  Step '1/3 现状'
+  Show-Compact
+
+  Say ''
+  Step '2/3 判断'
+  $crash = Get-CrashFacts
+  if (-not $crash) {
+    Ok '  没有崩溃日志，不像是启动崩溃。'
+    Say '  如果应用起不来但没日志：先 dsh-rescue snapshot，再把 %APPDATA%\@deepseek-ai\dsh-desktop\logs 里的最新文件发人看。'
+    Say ''
+    return
+  }
+
+  Say "  最新崩溃：$($crash.When)"
+  Say "  错误行  ：$($crash.ErrLine)"
+  Say "  类型    ：$($crash.Class) 类"
+
+  # 每类给"做什么 + 为什么 + 做完看什么"
+  $plan = $null
+  $snapName = $null
+  $why = $null
+  $after = '启动应用，能进主界面就回来跑 dsh-rescue verify'
+
+  switch ($crash.Class) {
+    '甲' {
+      $plan = 'minimal'
+      $why = '必需插件没激活：dsh-base 的 bundle 层没被应用，先退到最小配置让它能起来，再装回插件。'
+    }
+    '乙' {
+      $best = Get-BestSnapshot
+      if (-not $best) { Bad '  没有可用的良好快照，先 dsh-rescue snapshot 再说。'; return }
+      $plan = 'restore'; $script:Snapshot = $best; $snapName = $best
+      $why = "Host 在启动阶段读字段失败：坏在 node_modules 依赖树，不在配置层。回退到快照 $best 那棵验证过的依赖树。"
+    }
+    '丙' {
+      $plan = 'reset-cookies'
+      $why = '宿主跑起来了并报了错，问题在登录态（Cookies）。'
+      $after = '启动应用，重新登录一次，然后跑 dsh-rescue verify'
+    }
+    '丙-宿主' {
+      $best = Get-BestSnapshot
+      $plan = 'restore'; $script:Snapshot = $best; $snapName = $best
+      $why = '日志里没有 host diagnostic：宿主根本没起来，main 把"连不上宿主"包装成了登录失败。先别删 Cookies，先回退依赖树。'
+      if (-not $best) { Bad '  没有可用的良好快照，先 snapshot。'; return }
+    }
+    '丁' {
+      $plan = 'strip-bom'
+      $why = '配置文件开头有 UTF-8 BOM，宿主 JSON.parse 直接失败。只减 3 字节，不动内容。'
+    }
+    default {
+      $plan = 'snapshot'
+      $why = '没命中已知类型。先留一个还原点，再把日志第一行发人看。'
+      $after = '把上面那行错误发回来'
+    }
+  }
+
+  Say ''
+  Step '3/3 建议'
+  Say "  打算做：$plan$(if ($snapName) { " -Snapshot $snapName" })"
+  Say "  为什么：$why"
+  Say "  做完看：$after"
+
+  if ($plan -ne 'snapshot' -and (Test-AppRunning) -and -not $Force) {
+    Say ''
+    Warn '  应用正在运行。这类修复要应用完全退出（含托盘）才安全。'
+    Say '  请先退出应用，再重新跑：dsh-rescue'
+    Say ''
+    return
+  }
+
+  Say ''
+  if (-not (Confirm-Step "现在执行 $plan 吗？")) {
+    Say ''
+    Say '  没执行。要手动做就抄这条：'
+    Say "    dsh-rescue $plan$(if ($snapName) { " -Snapshot $snapName" })"
+    Say ''
+    return
+  }
+
+  Say ''
+  switch ($plan) {
+    'minimal'       { Invoke-Minimal }
+    'restore'       { Invoke-Restore }
+    'strip-bom'     { Invoke-StripBom }
+    'reset-cookies' { Invoke-ResetCookies }
+  'verify'        { Invoke-Verify }
+    'snapshot'      { $d = New-Snapshot -Reason 'guide'; Ok "已备份：$d" }
+  }
+
+  Say ''
+  Say '=== 下一步 ===' -ForegroundColor White
+  Say "  1) 启动 DeepSeek Harness"
+  Say "  2) $after"
+  if ($crash.Class -eq '甲') { Say '  3) 起来之后跑：dsh-rescue restore' }
+  Say ''
+}
+
 # ---------------- 分发 ----------------
-if ([string]::IsNullOrWhiteSpace($Command)) { $Command = 'status' }
+if ([string]::IsNullOrWhiteSpace($Command)) { $Command = 'guide' }
 
 if ($Command -eq 'help') {
   Say @'
@@ -775,10 +984,13 @@ DSH 急救 · dsh-rescue
   -AppDataDir <路径>   默认 %APPDATA%\@deepseek-ai\dsh-desktop
   -Force               应用在运行中也继续（不推荐）
 
-三步：
-  1. dsh-rescue diagnose          ← 永远先做这个
-  2. 按它说的抄一条命令
-  3. 重启应用；起不来就 dsh-rescue rollback
+直接跑 dsh-rescue（不带命令）就是向导：它看现状 → 判类型 →
+告诉你打算做什么、为什么、做完看什么，问过你才动手。
+
+单独用的命令：
+  1. dsh-rescue diagnose          ← 只想看判断时
+  2. dsh-rescue verify            ← 修完重启后核对是否真的好了
+  3. dsh-rescue rollback          ← 不满意就退回去
 '@
   return
 }
@@ -791,6 +1003,8 @@ switch ($Command) {
   'restore'       { Invoke-Restore }
   'rollback'      { Invoke-Rollback }
   'reset-cookies' { Invoke-ResetCookies }
+  'verify'        { Invoke-Verify }
+  'guide'         { Invoke-Guide }
   'strip-bom'     { Invoke-StripBom }
   'install'       { Invoke-Install }
 }
