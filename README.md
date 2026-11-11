@@ -2,7 +2,7 @@
 
 DSH 桌面端起不来时用它：**先判断是哪一类故障，再走对应的那一条路**。修的是 profile 配置层，不碰会话、附件、记忆、锚点、凭据。
 
-**当前版本：v1.5.0**
+**当前版本：v1.5.1**
 
 ---
 
@@ -214,6 +214,7 @@ dsh-rescue fix-env      # 从 .env 删掉日志点名的那一行，先自动备
 | `dsh-rescue strip-bom` | 丁类用：去掉配置文件开头的 BOM | 是（只减 3 字节） |
 | `dsh-rescue fix-env` | 戊类用：从 `~/.dsh/.env` 删掉宿主不允许的键（先备份） | 是 |
 | `dsh-rescue snapshots` | 列快照（依赖数 / 是否带 BOM / 有没有补丁） | 否 |
+| `dsh-rescue report` | 把崩溃原文、配置、快照清单写成一份 txt | 只写报告目录 |
 | `dsh-rescue install` | 把短命令写进 PowerShell profile | 是（只改 profile） |
 | `dsh-rescue help` | 用法 | 否 |
 

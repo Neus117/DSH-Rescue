@@ -28,7 +28,7 @@
 param(
   [Parameter(Position = 0)]
   [ValidateSet('status', 'diagnose', 'snapshot', 'minimal', 'restore', 'rollback',
-               'reset-cookies', 'strip-bom', 'fix-env', 'snapshots', 'install', 'verify', 'guide', 'help')]
+               'reset-cookies', 'strip-bom', 'fix-env', 'snapshots', 'report', 'install', 'verify', 'guide', 'help')]
   [string]$Command = '',
 
   [string]$ProfileDir = '',
@@ -544,8 +544,15 @@ function Show-Diagnose {
     }
   }
   else {
-    Say '  错误类型没有命中已知模式。先 snapshot 保底，再人工看日志里第一段 --- error ---。'
-    Say '  把那一行原样发回来，我按它加一个分支。'
+    Say '  没命中已知类型。别猜——我已经把该看的都写进一份报告了：'
+    $rp = Save-DiagnosisReport
+    Ok "  $rp"
+    Say ''
+    Say '  下一步（按顺序试，不用你复述日志）：'
+    Say '    1) dsh-rescue snapshots                    看哪份快照是好的'
+    Say '    2) dsh-rescue restore -Snapshot <名字>      回退到那份'
+    Say '    3) 还不行就 dsh-rescue rollback'
+    Say '  要人来判断时，把上面那个报告文件发过去就行（里面已有崩溃原文、配置、快照清单）。'
   }
   Say ""
 }
@@ -934,9 +941,12 @@ function Invoke-Guide {
       $why = '配置文件开头有 UTF-8 BOM，宿主 JSON.parse 直接失败。只减 3 字节，不动内容。'
     }
     default {
-      $plan = 'snapshot'
-      $why = '没命中已知类型。先留一个还原点，再把日志第一行发人看。'
-      $after = '把上面那行错误发回来'
+      $best = Get-BestSnapshot
+      $plan = if ($best) { 'restore' } else { 'snapshot' }
+      if ($best) { $script:Snapshot = $best; $snapName = $best }
+      $why = '没命中已知类型。这种情况最可能是配置层的残局，所以先回退到最近的良好快照；现场已写进报告，事后可查。'
+      $after = '启动应用；还不起来就 dsh-rescue rollback'
+      $script:GuideReport = Save-DiagnosisReport
     }
   }
 
@@ -1042,6 +1052,73 @@ function Invoke-ListSnapshots {
   Say '用法：dsh-rescue restore -Snapshot <名字>'
 }
 
+# ---------------- 现场报告（把该看的都写进一个文件，不要求用户复述日志） ----------------
+function Save-DiagnosisReport {
+  $dir = Join-Path $RescueRoot 'reports'
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $path = Join-Path $dir ('report-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.txt')
+
+  $out = New-Object System.Collections.Generic.List[string]
+  $out.Add('DSH 急救报告  ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+  $out.Add('')
+
+  $c = Get-CrashFacts
+  $out.Add('== 崩溃 ==')
+  if ($c) {
+    $out.Add("日志  : $($c.Path)")
+    $out.Add("时间  : $($c.When)")
+    $out.Add("分类  : $($c.Class)")
+    $out.Add("错误  : $($c.ErrLine)")
+    $out.Add("host diagnostic 段: $($c.HasHostDiag)")
+    $out.Add('')
+    $out.Add('== 崩溃日志原文（前 60 行）==')
+    foreach ($l in (Get-Content $c.Path -TotalCount 60 -ErrorAction SilentlyContinue)) { $out.Add($l) }
+  } else {
+    $out.Add('没有崩溃日志')
+  }
+
+  $out.Add('')
+  $out.Add('== profile ==')
+  $json = Read-ProfileJson
+  $deps = @(Get-DepNames $json)
+  $nm = Join-Path $ProfileDir 'node_modules'
+  $out.Add("路径            : $ProfileDir")
+  $out.Add("依赖            : $($deps.Count) 个 — " + ($deps -join ', '))
+  $out.Add("bundles         : " + (@(Get-Bundles $json) -join ', '))
+  $out.Add("patch 条目      : " + (@(Get-PatchIds) -join ', '))
+  $out.Add("node_modules    : " + (Test-Path $nm))
+  $out.Add("lockfile        : " + (Test-Path (Join-Path $ProfileDir 'pnpm-lock.yaml')))
+  $ws = Join-Path $ProfileDir 'pnpm-workspace.yaml'
+  $out.Add("workspace 补丁  : " + ((Test-Path $ws) -and [bool](Select-String -Path $ws -Pattern 'patchedDependencies' -Quiet)))
+  $bom = @(Get-BomCandidates | Where-Object { Test-BomFile $_.FullName })
+  $out.Add("带 BOM 的文件   : " + $(if ($bom.Count -gt 0) { ($bom | ForEach-Object { $_.Name }) -join ', ' } else { '无' }))
+  $out.Add("Cookies         : " + (Get-CookieReport).Detail)
+
+  $out.Add('')
+  $out.Add('== 快照（新 → 旧）==')
+  foreach ($s in @(Get-Snapshots)) {
+    $pkg = Join-Path $s.FullName 'package.json'
+    $d = 0; $b = $false
+    if (Test-Path $pkg) {
+      $bytes = [System.IO.File]::ReadAllBytes($pkg)
+      $b = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+      try { $d = @(([System.Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json).dependencies.PSObject.Properties).Count } catch { }
+    }
+    $out.Add(("  {0}  deps={1}  BOM={2}" -f $s.Name, $d, $b))
+  }
+
+  $out.Add('')
+  $out.Add('== ~/.dsh/.env 的键（值不记录）==')
+  $envPath = Join-Path $HomeDir '.dsh\.env'
+  if (Test-Path $envPath) {
+    Get-Content $envPath | Where-Object { $_ -match '^\s*[A-Za-z_][A-Za-z0-9_]*\s*=' } |
+      ForEach-Object { $out.Add('  ' + ($_ -split '=', 2)[0].Trim()) }
+  } else { $out.Add('  （没有 .env）') }
+
+  [System.IO.File]::WriteAllText($path, ($out -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+  return $path
+}
+
 # ---------------- 分发 ----------------
 if ([string]::IsNullOrWhiteSpace($Command)) { $Command = 'guide' }
 
@@ -1059,6 +1136,7 @@ DSH 急救 · dsh-rescue
   strip-bom      丁类用：配置文件带 UTF-8 BOM 时去掉它
   fix-env        戊类用：从 ~/.dsh/.env 删掉宿主不允许的键（先备份）
   snapshots      列出所有快照（依赖数 / 是否带 BOM / 有没有补丁）
+  report         把崩溃原文、配置、快照清单写成一个文件（不用你复述日志）
   install        把短命令 dsh-rescue 写进 PowerShell profile
 
 参数：
@@ -1092,5 +1170,6 @@ switch ($Command) {
   'strip-bom'     { Invoke-StripBom }
   'fix-env'       { Invoke-FixEnv }
   'snapshots'     { Invoke-ListSnapshots }
+  'report'        { $rp = Save-DiagnosisReport; Ok "报告已写入：$rp" }
   'install'       { Invoke-Install }
 }
