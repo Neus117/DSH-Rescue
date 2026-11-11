@@ -2,7 +2,7 @@
 
 DSH 桌面端起不来时用它：**先判断是哪一类故障，再走对应的那一条路**。修的是 profile 配置层，不碰会话、附件、记忆、锚点、凭据。
 
-**当前版本：v1.2.0**
+**当前版本：v1.3.0**
 
 ---
 
@@ -41,13 +41,14 @@ dsh-rescue diagnose
 | `... required plugins did not activate` | **甲类** 装载树 | `dsh-rescue minimal` → 启动确认 → `dsh-rescue restore` |
 | `Cannot read properties of undefined (reading '...')`，栈在 `dsh-desktop-host` | **乙类** 依赖树 | `dsh-rescue restore -Snapshot <上一个良好快照>` |
 | `desktop welcome: Web authentication failed` | **丙类** 主进程握手 | **先看日志里有没有 `host diagnostic` 段**，见下节 |
+| `Unexpected token '﻿'` / `is not valid JSON`，栈在 `readProfileManifest` | **丁类** 文件编码 | `dsh-rescue strip-bom` |
 | 都不像 | 未知 | `dsh-rescue snapshot` 保底，把日志那一段发人看 |
 
-**这三类的修法互斥。** 用错一条不但无效，还会顺手把插件配置清掉。
+**这四类的修法互斥。** 用错一条不但无效，还会顺手把插件配置清掉。
 
 ---
 
-## 三类故障
+## 四类故障
 
 ### 甲类：必需插件没激活
 
@@ -118,6 +119,28 @@ Cookies 的真实位置：`%APPDATA%\@deepseek-ai\dsh-desktop\Network\Cookies`�
 
 `reset-cookies` 只是**改名**成 `.bak-时间戳`，不是删除；要退回把名字改回来。
 
+### 丁类：配置文件带 BOM
+
+```
+DesktopHostFatalError: Unexpected token '﻿', "﻿{ "n"... is not valid JSON
+    at readProfileManifest (... dsh-app-boot/lib/index.js:1692)
+```
+
+- **坏在哪**：profile 的 `package.json` 开头多了一个 UTF-8 BOM（`EF BB BF`）。Node 的 `JSON.parse` **不认 BOM**，第一个字符就炸。宿主在读清单时崩，插件一层都还没轮到。
+- **典型起因**：用 **PowerShell 5.1** 写了这个文件。`Set-Content -Encoding UTF8`、`Out-File`、`ConvertTo-Json | Set-Content` 在 5.1 里**都会写 BOM**（7 的 `utf8` 才不带）。
+- **判据**：报错里的 `"﻿{` 那个方块就是 BOM；或者 `status` 直接报"文件编码 … 带 BOM"。
+- **命令**（应用要完全退出）：
+
+```powershell
+dsh-rescue strip-bom
+```
+
+它逐个扫 profile 根目录的 `*.json` / `*.yml` / `*.yaml`，把 BOM 去掉（只减 3 字节，内容不动）。
+
+> **`restore` 会自动去 BOM**：快照本身可能就是坏的（带 BOM 的 package.json 被存进去过），所以装回去时会剥掉，不会把崩溃原样搬回来。这条是 v1.3.0 修的——v1.2.0 之前，`restore` 会**忠实复现**这个崩溃。
+
+**根治**：改这几个文件用 `pwsh`，或者显式指定 `-Encoding utf8NoBOM`。
+
 ---
 
 ## 命令
@@ -131,6 +154,7 @@ Cookies 的真实位置：`%APPDATA%\@deepseek-ai\dsh-desktop\Network\Cookies`�
 | `dsh-rescue restore` | 装回良好依赖 + patch（有 lockfile 则冻结版本） | 是 |
 | `dsh-rescue rollback` | 列出所有快照，挑一份写回 | 是 |
 | `dsh-rescue reset-cookies` | 丙类用：把 Cookies 改名（可回退） | 是 |
+| `dsh-rescue strip-bom` | 丁类用：去掉配置文件开头的 BOM | 是（只减 3 字节） |
 | `dsh-rescue install` | 把短命令写进 PowerShell profile | 是（只改 profile） |
 | `dsh-rescue help` | 用法 | 否 |
 
@@ -138,18 +162,19 @@ Cookies 的真实位置：`%APPDATA%\@deepseek-ai\dsh-desktop\Network\Cookies`�
 
 ---
 
-## 别做这四件事
+## 别做这五件事
 
-这四条都是**真实踩过**的，代价写在后面。
+这五条都是**真实踩过**的，代价写在后面。
 
 | ❌ 不要 | 后果 |
 |---|---|
-| 用 `minimal` 去修**不是甲类**的崩溃 | 它只清配置，对乙类丙类无效；而且会把 `cordis.patch.yml` 清空，插件配置丢一遍 |
+| 用 `minimal` 去修**不是甲类**的崩溃 | 它只清配置，对乙/丙/丁类无效；而且会把 `cordis.patch.yml` 清空，插件配置丢一遍 |
 | 手工删 `node_modules` / `pnpm-lock.yaml` / 把 patch 写成 `[]` | 和上一条一样：自伤，而且删了 lockfile 后 `^0.3.8` 可能解析出没验证过的新版本 |
-| 用 `link:` 把本地包接进 profile | 乙类故障的典型起因；要改本地包用 `pnpm patch`，或只覆盖它的 `lib/` |
+| 用 `link:` 把本地包接进 profile，或**手工覆盖 `node_modules` 里的文件** | 乙类故障的典型起因；要改本地包用 `pnpm patch`，或只在独立测试 profile 里试 |
+| 用 PowerShell 5.1 的 `Set-Content -Encoding UTF8` 改 profile 配置 | 会写 BOM，宿主 `JSON.parse` 直接失败（丁类）；改用 `pwsh` 或 `-Encoding utf8NoBOM` |
 | 把"pnpm 说 Done / 依赖都在位"当成"应用能用" | 安装成功 ≠ 启动成功。**只有重启进得去主界面才算验证** |
 
-**判断口诀**：`diagnose` 说甲类才碰配置；说乙类只碰依赖；说丙类只碰 Cookies；说不认识就只做 `snapshot`。
+**判断口诀**：`diagnose` 说甲类才碰配置；说乙类只碰依赖；说丙类先看 `host diagnostic`；说丁类只碰文件编码；说不认识就只做 `snapshot`。
 
 ---
 
@@ -183,6 +208,8 @@ Cookies 的真实位置：`%APPDATA%\@deepseek-ai\dsh-desktop\Network\Cookies`�
 | Cookies **被占用不算坏** | 应用在运行时独占锁 SQLite 是正常状态，之前会误报成"打不开" |
 | `diagnose` 不再靠关键词白名单 | 改成直接取 `--- error ---` 后面第一行——白名单每遇到新故障就漏一次（v1.0 和 v1.1 各漏一次） |
 | `diagnose` 先看 `host diagnostic` 在不在 | 丙类的两个原因症状完全一样，这是唯一能区分的结构信号 |
+| **`restore` 装回去时自动去 BOM** | 快照可能本身就存着带 BOM 的 `package.json`；原样拷回等于复现崩溃 |
+| **去 BOM 走"读源→写目标"而不是"拷完再改"** | v1.2.0 那种写法在文件被占用时会**静默失败**，却照样报成功 |
 
 ## 已知限制
 
@@ -208,6 +235,7 @@ dsh-rescue minimal         # 甲类
 dsh-rescue restore         # 装回依赖
 dsh-rescue rollback        # 回退（会列快照）
 dsh-rescue reset-cookies   # 丙类
+dsh-rescue strip-bom       # 丁类
 ```
 
 没装短命令时，把 `dsh-rescue xxx` 换成：

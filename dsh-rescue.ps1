@@ -28,7 +28,7 @@
 param(
   [Parameter(Position = 0)]
   [ValidateSet('status', 'diagnose', 'snapshot', 'minimal', 'restore', 'rollback',
-               'reset-cookies', 'install', 'help')]
+               'reset-cookies', 'strip-bom', 'install', 'help')]
   [string]$Command = '',
 
   [string]$ProfileDir = '',
@@ -237,6 +237,54 @@ function Copy-FileAtomic {
   Move-Item -Path $tmp -Destination $To -Force
 }
 
+# ---------------- BOM：UTF-8 BOM 会让 JSON.parse 直接失败 ----------------
+# 装一个配置文件：读源字节 → 去 BOM → 原子写到目标。
+# 不做"先拷再改"——那一步会在文件被占用时静默失败。
+function Install-ConfigFile {
+  param([string]$From, [string]$To)
+  $bytes = [System.IO.File]::ReadAllBytes($From)
+  $stripped = $false
+  if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+    $bytes = $bytes[3..($bytes.Length - 1)]
+    $stripped = $true
+  }
+  $tmp = "$To.tmp-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+  [System.IO.File]::WriteAllBytes($tmp, $bytes)
+  Move-Item -Path $tmp -Destination $To -Force
+  return $stripped
+}
+
+function Test-BomFile {
+  param([string]$Path)
+  try {
+    $fs = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+    try {
+      $b = New-Object byte[] 3
+      if ($fs.Read($b, 0, 3) -lt 3) { return $false }
+      return ($b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)
+    } finally { $fs.Dispose() }
+  } catch { return $false }
+}
+
+# 去掉 BOM（逐字节重写，保留原换行与内容）
+function Remove-BomFile {
+  param([string]$Path)
+  if (-not (Test-Path $Path)) { return $false }
+  if (-not (Test-BomFile $Path)) { return $false }
+  $bytes = [System.IO.File]::ReadAllBytes($Path)
+  $body = $bytes[3..($bytes.Length - 1)]
+  $tmp = "$Path.tmp-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+  [System.IO.File]::WriteAllBytes($tmp, $body)
+  Move-Item -Path $tmp -Destination $Path -Force
+  return $true
+}
+
+# profile 根目录里所有可能被 JSON/YAML 解析的文本文件
+function Get-BomCandidates {
+  @(Get-ChildItem $ProfileDir -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Extension -in @('.json', '.yml', '.yaml') })
+}
+
 # ---------------- pnpm：硬超时 + 超时杀进程树 ----------------
 function Invoke-Pnpm {
   param([string]$Node, [string]$Pnpm, [string]$Dir, [string[]]$PnpmArgs, [int]$TimeoutSec = 180)
@@ -303,6 +351,11 @@ function Show-Status {
   $ck = Get-CookieReport
   if ($ck.Bad) { Bad "登录态        : $($ck.Detail)" }
   else { Say "登录态        : $($ck.Detail)" }
+
+  $bomFiles = @(Get-BomCandidates | Where-Object { Test-BomFile $_.FullName })
+  if ($bomFiles.Count -gt 0) {
+    Bad ('文件编码      : ' + (($bomFiles | ForEach-Object { $_.Name }) -join ', ') + ' 带 BOM → 宿主会解析失败')
+  }
 
   Say ''
   Say '下一步（按情况挑一条，直接粘）：'
@@ -428,11 +481,30 @@ function Show-Diagnose {
       Say '    3) 前两步都无效，才考虑 reset-cookies'
     }
   }
+  elseif ($errText -match 'readProfileManifest|is not valid JSON|Unexpected token') {
+    # 丁类：配置解析失败（BOM 或语法）
+    Say '  丁类故障：配置文件解析失败（BOM 或 JSON/YAML 语法坏了）。'
+    Say '  栈里的 readProfileManifest 说明宿主在读 profile 的 package.json 时就崩了，'
+    Say '  插件一层都还没轮到。'
+    $bad = @(Get-BomCandidates | Where-Object { Test-BomFile $_.FullName })
+    if ($bad.Count -gt 0) {
+      Bad ('  带 BOM 的文件：' + (($bad | ForEach-Object { $_.Name }) -join ', '))
+    } else {
+      Say '  现在没扫到 BOM（可能已被别的操作覆盖）；若仍报错，问题在 JSON 语法本身。'
+    }
+    Say ''
+    Say '  处置（应用要完全退出）：'
+    Say '    pwsh -File dsh-rescue.ps1 strip-bom'
+    Say '  解析还是失败就退回上一份良好快照：restore -Snapshot <名字>'
+    Say '  提醒：PowerShell 5.1 的 Set-Content -Encoding UTF8 会写 BOM，别用它改这些文件。'
+  }
   else {
     Say '  错误类型没有命中已知模式。先 snapshot 保底，再人工看日志里第一段 --- error ---。'
+    Say '  把那一行原样发回来，我按它加一个分支。'
   }
   Say ""
 }
+
 # ---------------- minimal ----------------
 function Invoke-Minimal {
   Assert-AppClosed
@@ -518,16 +590,20 @@ function Invoke-Restore {
   Ok "已备份当前配置：$snap"
 
   Step "还原依赖清单：$($depSource.FullName)"
-  Copy-FileAtomic -From $depSource.FullName -To (Join-Path $ProfileDir 'package.json')
+  $stripped = @()
+  if (Install-ConfigFile -From $depSource.FullName -To (Join-Path $ProfileDir 'package.json')) { $stripped += 'package.json' }
   $ws = Join-Path $srcDir 'pnpm-workspace.yaml'
-  if (Test-Path $ws) { Copy-FileAtomic -From $ws -To (Join-Path $ProfileDir 'pnpm-workspace.yaml') }
+  if (Test-Path $ws) {
+    if (Install-ConfigFile -From $ws -To (Join-Path $ProfileDir 'pnpm-workspace.yaml')) { $stripped += 'pnpm-workspace.yaml' }
+  }
   Ok 'package.json 已还原'
+  if ($stripped.Count -gt 0) { Warn ('源文件带 BOM，已去掉：' + ($stripped -join ', ')) }
 
   # 有 lockfile 就一起还原：锁定成当时能跑的那棵树，避免 ^ 解析出更新的版本
   $frozen = $false
   $lf = Join-Path $srcDir 'pnpm-lock.yaml'
   if (Test-Path $lf) {
-    Copy-FileAtomic -From $lf -To (Join-Path $ProfileDir 'pnpm-lock.yaml')
+    if (Install-ConfigFile -From $lf -To (Join-Path $ProfileDir 'pnpm-lock.yaml')) { Warn 'lockfile 也带 BOM，已去掉' }
     $frozen = $true
     Ok 'pnpm-lock.yaml 已还原（将按它冻结安装）'
   } else {
@@ -536,7 +612,7 @@ function Invoke-Restore {
 
   if ($patchSource) {
     Step "还原 patch：$($patchSource.Name)"
-    Copy-FileAtomic -From $patchSource.FullName -To (Join-Path $ProfileDir 'cordis.patch.yml')
+    if (Install-ConfigFile -From $patchSource.FullName -To (Join-Path $ProfileDir 'cordis.patch.yml')) { Warn 'patch 带 BOM，已去掉' }
     Ok 'cordis.patch.yml 已还原'
   } else {
     Warn '没有可用的 patch 备份，保留当前 patch'
@@ -658,6 +734,24 @@ function Invoke-Install {
   Say '  dsh-rescue snapshot' -ForegroundColor Yellow
 }
 
+# ---------------- strip-bom ----------------
+function Invoke-StripBom {
+  Assert-AppClosed
+  $files = @(Get-BomCandidates | Where-Object { Test-BomFile $_.FullName })
+  if ($files.Count -eq 0) {
+    Ok "profile 里的 json / yml 都没有 BOM（$ProfileDir）"
+    return
+  }
+  Step "发现 $($files.Count) 个带 BOM 的文件（BOM 会让 JSON.parse 直接报 Unexpected token）"
+  foreach ($f in $files) { Say "  $($f.Name)  ($($f.Length)B)" }
+  foreach ($f in $files) {
+    if (Remove-BomFile $f.FullName) { Ok "已去掉 BOM：$($f.Name)" }
+  }
+  Say ''
+  Say '下一步：启动 DeepSeek Harness 验证。' -ForegroundColor Yellow
+  Say '以后别在 PowerShell 5.1 里用 Set-Content -Encoding UTF8 改这些文件（会写 BOM）。' -ForegroundColor Yellow
+}
+
 # ---------------- 分发 ----------------
 if ([string]::IsNullOrWhiteSpace($Command)) { $Command = 'status' }
 
@@ -672,6 +766,7 @@ DSH 急救 · dsh-rescue
   restore        装回良好依赖 + patch（有 lockfile 则冻结安装）
   rollback       把快照写回（默认最近一份，会列出所有快照）
   reset-cookies  丙类用：登录态坏了，把 Cookies 改名（不删除，可回退）
+  strip-bom      丁类用：配置文件带 UTF-8 BOM 时去掉它
   install        把短命令 dsh-rescue 写进 PowerShell profile
 
 参数：
@@ -696,5 +791,6 @@ switch ($Command) {
   'restore'       { Invoke-Restore }
   'rollback'      { Invoke-Rollback }
   'reset-cookies' { Invoke-ResetCookies }
+  'strip-bom'     { Invoke-StripBom }
   'install'       { Invoke-Install }
 }
