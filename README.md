@@ -1,148 +1,224 @@
 # DSH 急救 · DSH Rescue
 
-DSH 桌面端起不来时的急救工具：先诊断，再按故障类型分档修复，全程可回滚。**只碰配置层，永远不碰你的会话数据。**
+DSH 桌面端起不来时用它：**先判断是哪一类故障，再走对应的那一条路**。修的是 profile 配置层，不碰会话、附件、记忆、锚点、凭据。
 
-**当前版本：v1.0.0**
+**当前版本：v1.1.0**
 
-## 它解决什么问题
+---
 
-DeepSeek Harness 桌面端的 profile 目录（`~/.dsh/profiles/desktop`）里，四个文件决定"启动时装哪些插件、怎么装"：
+## 第一次用：先装一次短命令
 
-```
-package.json         依赖清单 + bundle 列表
-cordis.patch.yml     插件配置覆盖层
-pnpm-workspace.yaml  安装方式（hoisted）
-pnpm-lock.yaml       锁定的版本树
-```
-
-这层被写坏，应用就起不来，报错还各不相同。而真正值钱的东西——会话、附件、记忆、锚点、凭据——都在**别的目录**，从头到尾没坏过。
-
-这个脚本做的事，是把"哪种坏法、该动哪一档、怎么退回去"固化成命令。**它的价值不在修得快，而在让人不在错误的位置动手**——比如对"依赖树污染"类故障执行"清空配置"是无效的，而那一步会顺手丢掉插件配置。
-
-## 快速开始
-
-1. 把 `dsh-rescue.ps1` 放到 `C:\Users\<你>\.dsh\rescue\`（**故意放在 profile 外面**：profile 坏了它还得能用）。
-2. 出事时先诊断，别急着动手：
+脚本不在 PATH 上，所以**每次都要写完整路径**——这就是最容易出错的地方。装一次短命令，之后只需要敲 `dsh-rescue`：
 
 ```powershell
-pwsh -File "$env:USERPROFILE\.dsh\rescue\dsh-rescue.ps1" diagnose
+pwsh -NoProfile -File "$env:USERPROFILE\.dsh\rescue\dsh-rescue.ps1" install
 ```
 
-3. 按诊断给的分支走。诊断会明确告诉你是甲类还是乙类。
-
-## 六个命令
-
-| 命令 | 做什么 | 会改文件吗 |
-|---|---|---|
-| `status` | 依赖几个、装没装、bundles 齐不齐、safemode 状态 | 不 |
-| `diagnose` | 读最新崩溃日志，抓出卡住的必需插件，判定故障类型 | 不 |
-| `snapshot` | 手动打一个还原点 | 只写备份目录 |
-| `minimal` | 退到最小可启动配置（bundles 只留 base + web-app，依赖清空） | 是 |
-| `restore` | 还原良好依赖清单 + patch，再用 lockfile 冻结安装 | 是 |
-| `rollback` | 列出所有快照（时间 / 原因 / 依赖数）让你挑，然后写回 | 是 |
-
-## 两类故障，两条路
-
-诊断只认两类，因为它们的**修法互斥**——用错一条不但无效，还会丢配置。
-
-| | 甲类 | 乙类 |
-|---|---|---|
-| 日志特征 | `N required plugins did not activate` | `Cannot read properties of undefined (reading '...')`，栈在 `dsh-desktop-host` |
-| 坏在哪 | 装载树：基础 bundle 层没被应用 | `node_modules` 依赖树 |
-| 典型起因 | 插件管理操作（`set_bundle` / `install_bundle`）写到一半进程死了 | 用 `link:` 指向了自带依赖的包，hoisted 布局下把公共包名顶到了宿主用的位置 |
-| 走哪条 | `minimal` → 启动确认 → `restore` | `restore -Snapshot <上一个良好快照>`，必要时先删 `node_modules` |
-| `minimal` 有用吗 | 有用，先让它能起来 | **完全无效**，它只清配置不清依赖 |
+然后**重开一个终端**（或先执行 `. $PROFILE`），确认能用了：
 
 ```powershell
-# 甲类
-pwsh -File dsh-rescue.ps1 minimal
-# 启动应用确认能进主界面，然后
-pwsh -File dsh-rescue.ps1 restore
-
-# 乙类：指定"上一次能跑"的那份快照
-pwsh -File dsh-rescue.ps1 restore -Snapshot <上一个良好快照>
+dsh-rescue status
 ```
+
+装出来的东西就是一行函数，写在 `Documents\PowerShell\Microsoft.PowerShell_profile.ps1` 里，带 `# >>> dsh-rescue >>>` 标记；重复执行只会更新、不会重复追加。
+
+> 没装短命令也能用。下文所有命令都同时给两种写法：
+> 带 `dsh-rescue` 的（已装短命令），和带完整路径的（没装）。
+> **不要用 `.\dsh-rescue.ps1`**：那要求你当前目录正好是脚本所在目录，而且 PowerShell 默认不允许运行当前目录下的脚本。
+
+---
+
+## 出事了先做这一件事（30 秒）
+
+```powershell
+dsh-rescue diagnose
+```
+
+它会读**最新那份崩溃日志**，打印出 `--- error ---` 下面的那一行，然后判定故障类型。**这一行决定你走哪条路，不要跳过。**
+
+| 日志里那一行长什么样 | 哪一类 | 该跑哪条 |
+|---|---|---|
+| `... required plugins did not activate` | **甲类** 装载树 | `dsh-rescue minimal` → 启动确认 → `dsh-rescue restore` |
+| `Cannot read properties of undefined (reading '...')`，栈在 `dsh-desktop-host` | **乙类** 依赖树 | `dsh-rescue restore -Snapshot <上一个良好快照>` |
+| `desktop welcome: Web authentication failed` | **丙类** 登录态 | `dsh-rescue reset-cookies` |
+| 都不像 | 未知 | `dsh-rescue snapshot` 保底，把日志那一段发人看 |
+
+**这三类的修法互斥。** 用错一条不但无效，还会顺手把插件配置清掉。下表写清了三类各自"坏在哪、该动什么"。
+
+---
+
+## 三类故障
+
+### 甲类：必需插件没激活
+
+```
+DesktopHostFatalError: dsh: startup failed: 2 required plugins did not activate
+```
+
+- **坏在哪**：装载树。dsh-base 这一层 bundle 没被应用，基础插件整块 disabled，于是 `tools` / `agents` / `sessions` 没有提供者。
+- **典型起因**：插件管理操作（`set_bundle` / `install_bundle`）写到一半进程死了。判据是操作日志里那条只有 `started`、**没有 `settled`**。
+- **要动**：`package.json` 的 bundles、`cordis.patch.yml`。
+- **命令**：
+
+```powershell
+dsh-rescue minimal        # 退到最小可启动配置
+# 启动应用，能进主界面 = 活过来了
+dsh-rescue restore        # 再把插件装回去
+```
+
+### 乙类：Host 启动时读字段失败
+
+```
+DesktopHostFatalError: Cannot read properties of undefined (reading 'authenticatedUrl')
+    at main (... dsh-desktop-host/lib/index.js:605)
+```
+
+- **坏在哪**：`node_modules` 依赖树。**不是**配置问题。
+- **典型起因**：用 `link:` 指向了自带依赖的本地包，hoisted 布局下把 `openai` / `zod` 这类公共包名顶到了宿主用的位置。
+- **⚠ 这条机理是推断，未证实**（没读到宿主源码那一行）；但"回退依赖树"这个处置是验过的。
+- **要动**：依赖树，**不要动配置**。
+- **命令**：
+
+```powershell
+dsh-rescue restore -Snapshot <上一个良好快照>
+# 还不行：删 node_modules 再来一次
+Remove-Item -Recurse -Force "$env:USERPROFILE\.dsh\profiles\desktop\node_modules"
+dsh-rescue restore -Snapshot <上一个良好快照>
+```
+
+### 丙类：登录态坏了
+
+```
+Error: desktop welcome: Web authentication failed
+    at connectDesktopWelcome (... app.asar/lib/main.js:16856)
+```
+
+- **坏在哪**：应用数据目录里的 `Cookies`（Electron 的登录态 SQLite）。**和 profile、插件、node_modules 全都无关。**
+- **典型起因**：Cookies 被写坏——0 字节、文件头不是 SQLite、或者旁边留着一个非空的 `Cookies-journal`（上次写到一半）。
+- **要动**：只动 Cookies 这两个文件。
+- **命令**（应用要完全退出，含托盘）：
+
+```powershell
+dsh-rescue reset-cookies
+# 然后启动应用，重新登录一次
+```
+
+它把 `Cookies` / `Cookies-journal` **改名**成 `.bak-时间戳`，不是删除——要退回把名字改回来就行。
+
+---
+
+## 命令
+
+| 命令 | 做什么 | 会改文件 |
+|---|---|---|
+| `dsh-rescue` | 不带参数：看现状（只读） | 否 |
+| `dsh-rescue diagnose` | 读最新崩溃日志 + 判定故障类型（只读） | 否 |
+| `dsh-rescue snapshot` | 手动留一个还原点 | 只写备份目录 |
+| `dsh-rescue minimal` | 甲类用：退到最小可启动配置 | 是 |
+| `dsh-rescue restore` | 装回良好依赖 + patch（有 lockfile 则冻结版本） | 是 |
+| `dsh-rescue rollback` | 列出所有快照，挑一份写回 | 是 |
+| `dsh-rescue reset-cookies` | 丙类用：把 Cookies 改名（可回退） | 是 |
+| `dsh-rescue install` | 把短命令写进 PowerShell profile | 是（只改 profile） |
+| `dsh-rescue help` | 用法 | 否 |
+
+参数：`-Snapshot <名字>`（restore / rollback 选哪份快照）、`-ProfileDir <路径>`（默认 `~/.dsh/profiles/desktop`）、`-Force`（应用在跑也继续，不推荐）。
+
+---
+
+## 别做这四件事
+
+这四条都是**真实踩过**的，代价写在后面。
+
+| ❌ 不要 | 后果 |
+|---|---|
+| 用 `minimal` 去修**不是甲类**的崩溃 | 它只清配置，对乙类丙类无效；而且会把 `cordis.patch.yml` 清空，插件配置丢一遍 |
+| 手工删 `node_modules` / `pnpm-lock.yaml` / 把 patch 写成 `[]` | 和上一条一样：自伤，而且删了 lockfile 后 `^0.3.8` 可能解析出没验证过的新版本 |
+| 用 `link:` 把本地包接进 profile | 乙类故障的典型起因；要改本地包用 `pnpm patch`，或只覆盖它的 `lib/` |
+| 把"pnpm 说 Done / 依赖都在位"当成"应用能用" | 安装成功 ≠ 启动成功。**只有重启进得去主界面才算验证** |
+
+**判断口诀**：`diagnose` 说甲类才碰配置；说乙类只碰依赖；说丙类只碰 Cookies；说不认识就只做 `snapshot`。
+
+---
 
 ## 它动什么、不动什么
 
 | 动 | 不动 |
 |---|---|
-| `package.json`、`cordis.patch.yml`、`pnpm-workspace.yaml`、`pnpm-lock.yaml` | `~/.dsh/sessions`（会话） |
-| `node_modules`（仅 `restore`） | `~/.dsh/attachments`（附件） |
-| `~/.dsh/rescue/backups/`（快照） | `~/.dsh/storages`（记忆与设置） |
-| | `~/.dsh/anchors`（锚点） |
-| | `.credentials.yaml`、`.env`（凭据） |
+| `package.json`、`cordis.patch.yml`、`pnpm-workspace.yaml`、`pnpm-lock.yaml` | `~/.dsh/sessions` 会话 |
+| `node_modules`（仅 `restore`） | `~/.dsh/attachments` 附件 |
+| `~/.dsh/rescue/backups/` 快照目录 | `~/.dsh/storages` 记忆与设置 |
+| `%APPDATA%\@deepseek-ai\dsh-desktop\Cookies*`（仅 `reset-cookies`） | `~/.dsh/anchors` 锚点 |
+| PowerShell profile（仅 `install`） | `.credentials.yaml`、`.env` 凭据 |
 
-这不是靠自觉，是靠代码：所有写操作都走四个固定文件名，数据目录一次都没被引用。
+三次事故里，**上面"不动"那一列一次都没坏过**。看到"东西丢了"，先怀疑配置层，不要怀疑数据。
 
 ## 安全边界
 
-| 机制 | 实现 |
-|---|---|
-| 破坏性操作前自动备份 | `minimal` / `restore` 第一步就是存快照，保留最近 12 份 |
-| 应用在跑就拒绝执行 | 检测到 `DeepSeek Harness` 进程直接抛错，`-Force` 才放行 |
-| 可回滚 | `rollback` 默认最近一份，`-Snapshot` 指定任意一份；会先打印列表 |
-| 版本不被悄悄改掉 | `restore` 优先用快照自带的 `pnpm-lock.yaml` 做 `--frozen-lockfile` |
-| 不猜路径 | pnpm / node 从 `~/.dsh/dsh-runtimes` 里现找，找不到才回落 PATH |
+- 破坏性操作（`minimal` / `restore`）第一步自动存快照，保留最近 12 份。
+- 应用在跑就直接拒绝执行，`-Force` 才放行。
+- `rollback` 会先列出所有快照（时间 / 原因 / 依赖数）供你挑，不是只能退回上一步。
+- 快照里带 `pnpm-lock.yaml` 时按它冻结安装。
+- pnpm / node 从 `~/.dsh/dsh-runtimes` 现找，不写死路径。
 
 ## 已知限制
 
 | 限制 | 说明 | 出路 |
 |---|---|---|
-| 只支持 Windows | 依赖 PowerShell 7 + Windows 进程名 / 路径 | 无计划 |
-| 只认 `desktop` profile | 默认路径固定，可用 `-ProfileDir` 指定别的 | 自定义 profile 传参即可 |
-| 乙类故障的机理未证实 | "hoisted 布局下公共包名互相顶"是从崩溃日志、时间线和依赖清单推出来的，**没读到宿主源码那一行** | 处置方式本身有效（回退依赖树），但别拿它当定论 |
-| `minimal` 不清 `node_modules` | 残留依赖一般不影响启动，但极端情况下要手工删 | 输出里会提示这一档 |
-| 不修复 safemode | 只提示 `safemode.json` 处于 `armed` | 手工改 `armed: false` 或删文件 |
-| 修不了磁盘 / 权限 / 端口占用 | 它只管 profile 配置层 | 看崩溃日志第一段错误 |
+| 只支持 Windows | 依赖 PowerShell 7 与 Windows 路径/进程名 | 无计划 |
+| 只认 `desktop` profile | 其他 profile 要传 `-ProfileDir` | 传参即可 |
+| 乙类机理未证实 | 处置有效，但"为什么"是推断 | 别把它当定论去改别的 |
+| 修不了磁盘/权限/端口 | 只管 profile 配置层 + Cookies | 看日志第一段错误 |
+| `reset-cookies` 要重新登录 | 登录态本来就在这两个文件里 | 无 |
 
-## 命令速查
+## 全部命令（可逐条粘贴，无变量、不依赖当前目录）
 
 ```powershell
-$r = "$env:USERPROFILE\.dsh\rescue\dsh-rescue.ps1"
+# 装一次短命令（只有第一次需要）
+pwsh -NoProfile -File "$env:USERPROFILE\.dsh\rescue\dsh-rescue.ps1" install
 
-pwsh -File $r status                    # 现在什么状态
-pwsh -File $r diagnose                  # 先跑这个
-pwsh -File $r snapshot                  # 手动留还原点
-pwsh -File $r minimal                   # 甲类：先救活
-pwsh -File $r restore                   # 装回最近的良好依赖
-pwsh -File $r restore -Snapshot <名字>   # 指定快照
-pwsh -File $r rollback                  # 回退，会列快照
-pwsh -File $r help
+# 之后
+dsh-rescue                 # 看现状
+dsh-rescue diagnose        # 判定故障类型 —— 永远先做这个
+dsh-rescue snapshot        # 留还原点
+dsh-rescue minimal         # 甲类
+dsh-rescue restore         # 装回依赖
+dsh-rescue rollback        # 回退（会列快照）
+dsh-rescue reset-cookies   # 丙类
 ```
 
-参数：`-ProfileDir <路径>`（默认 `~/.dsh/profiles/desktop`）、`-Snapshot <名字>`、`-Force`。
+没装短命令时，把 `dsh-rescue xxx` 换成：
+
+```powershell
+pwsh -NoProfile -File "$env:USERPROFILE\.dsh\rescue\dsh-rescue.ps1" xxx
+```
+
+## 开发者
+
+单文件 PowerShell，无外部依赖，无构建。
+
+**验证必须用复制出来的 profile 副本**（`-ProfileDir` 指过去），不要拿正在用的那份试；`reset-cookies` 用 `-AppDataDir` 指到假目录测：
+
+```powershell
+$t = Join-Path $env:TEMP 'dsh-rescue-test'
+New-Item -ItemType Directory -Force -Path $t | Out-Null
+Copy-Item "$env:USERPROFILE\.dsh\profiles\desktop\*.yml","$env:USERPROFILE\.dsh\profiles\desktop\package.json" $t
+pwsh -NoProfile -File .\dsh-rescue.ps1 snapshot      -Force -ProfileDir $t
+pwsh -NoProfile -File .\dsh-rescue.ps1 minimal       -Force -ProfileDir $t
+pwsh -NoProfile -File .\dsh-rescue.ps1 restore       -Force -ProfileDir $t
+pwsh -NoProfile -File .\dsh-rescue.ps1 rollback      -Force -ProfileDir $t
+pwsh -NoProfile -File .\dsh-rescue.ps1 reset-cookies -Force -AppDataDir $t
+```
+
+**为什么要这么验**：`status` 曾经在"依赖为空"时直接崩——而那正好是 `minimal` 之后的状态，也就是急救最需要它工作的那一刻。只跑只读命令发现不了。
 
 ## 文档导航
 
 | 文档 | 面向 | 内容 |
 |---|---|---|
-| `README.md`（本文） | 第一次来的人 | 它是什么、怎么用、边界在哪 |
-| `release-notes/` | 已装旧版的人 | 每一版改了什么；正本在 GitHub Releases |
-| `--help` | 已经会用的人 | 参数与典型流程 |
-
-## 开发
-
-单文件 PowerShell 脚本，无外部依赖，不需要构建。
-
-改动后至少跑一遍只读命令验证，再跑一次 `minimal` / `restore` / `rollback` 全链（**在一份复制出来的 profile 上用 `-ProfileDir` 跑，别拿正在用的那份试**）：
-
-```powershell
-# 只读自检
-pwsh -NoProfile -File .\dsh-rescue.ps1 status
-pwsh -NoProfile -File .\dsh-rescue.ps1 diagnose
-
-# 全链验证：复制一份 profile 到临时目录，全部操作只指向它
-$t = Join-Path $env:TEMP 'dsh-rescue-test\desktop'
-New-Item -ItemType Directory -Force -Path $t | Out-Null
-Copy-Item "$env:USERPROFILE\.dsh\profiles\desktop\*.yml","$env:USERPROFILE\.dsh\profiles\desktop\package.json" $t
-pwsh -NoProfile -File .\dsh-rescue.ps1 minimal  -Force -ProfileDir $t
-pwsh -NoProfile -File .\dsh-rescue.ps1 restore  -Force -ProfileDir $t
-pwsh -NoProfile -File .\dsh-rescue.ps1 rollback -Force -ProfileDir $t
-```
-
-**为什么必须这么验**：`status` 在"依赖为空"时曾直接抛错——而那恰好是 `minimal` 之后最常见的状态，也就是急救最需要它工作的那一刻。只跑只读命令发现不了这类缺陷。
+| `README.md` | 第一次来的人 | 分诊、三类故障、命令、禁忌 |
+| `release-notes/` | 已装旧版的人 | 每版改了什么；正本在 GitHub Releases |
+| `dsh-rescue help` | 已经会用的人 | 参数与流程 |
 
 ## 许可
 
-个人工具，未附带许可证。要用于商业场景请先开 issue 说明。
+个人工具，未附带许可证。商业使用请先开 issue 说明。

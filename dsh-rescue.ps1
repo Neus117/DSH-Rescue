@@ -27,12 +27,16 @@
 [CmdletBinding()]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('status', 'diagnose', 'snapshot', 'minimal', 'restore', 'rollback', 'help')]
-  [string]$Command = 'status',
+  [ValidateSet('status', 'diagnose', 'snapshot', 'minimal', 'restore', 'rollback',
+               'reset-cookies', 'install', 'help')]
+  [string]$Command = '',
 
   [string]$ProfileDir = '',
 
   [string]$Snapshot = '',
+
+  # 仅用于测试：把“应用数据目录”指到别处，避免动到真实 Cookies
+  [string]$AppDataDir = '',
 
   [switch]$Force
 )
@@ -54,6 +58,51 @@ New-Item -ItemType Directory -Force -Path $BackupRoot | Out-Null
 
 $ConfigFiles = @('package.json', 'cordis.patch.yml', 'pnpm-workspace.yaml', 'pnpm-lock.yaml')
 $MaxBackups = 12
+
+# 应用数据目录：登录态（Cookies）在这里，与 profile 是两回事
+$AppDataRoot = if ([string]::IsNullOrWhiteSpace($AppDataDir)) {
+  Join-Path $env:APPDATA '@deepseek-ai\dsh-desktop'
+} else { [System.IO.Path]::GetFullPath($AppDataDir) }
+
+function Get-CookieFiles {
+  if (-not (Test-Path $AppDataRoot)) { return @() }
+  @(Get-ChildItem $AppDataRoot -File -Filter 'Cookies*' -ErrorAction SilentlyContinue)
+}
+
+# 判定 Cookies 是否可读：0 字节、非 SQLite 头、残留非空 journal 都算坏
+function Get-CookieReport {
+  $files = @(Get-CookieFiles)
+  if ($files.Count -eq 0) {
+    return [pscustomobject]@{ Exists = $false; Bad = $false; Detail = '没有 Cookies 文件（下次启动会重新登录）' }
+  }
+  $main = $files | Where-Object { $_.Name -eq 'Cookies' } | Select-Object -First 1
+  $journal = $files | Where-Object { $_.Name -eq 'Cookies-journal' } | Select-Object -First 1
+  $detail = (@($files | ForEach-Object { "$($_.Name)=$($_.Length)B" }) -join '  ')
+
+  $bad = $false
+  $why = ''
+  if ($main) {
+    if ($main.Length -eq 0) { $bad = $true; $why = 'Cookies 是 0 字节' }
+    else {
+      try {
+        $fs = [System.IO.File]::Open($main.FullName, 'Open', 'Read', 'ReadWrite')
+        try {
+          $buf = New-Object byte[] 15
+          [void]$fs.Read($buf, 0, 15)
+          if ([System.Text.Encoding]::ASCII.GetString($buf) -ne 'SQLite format 3') {
+            $bad = $true; $why = 'Cookies 不是 SQLite 文件头'
+          }
+        } finally { $fs.Dispose() }
+      } catch { $why = 'Cookies 打不开（被占用或权限问题）' }
+    }
+  }
+  if (-not $bad -and $journal -and $journal.Length -gt 0) {
+    $bad = $true; $why = '残留非空 Cookies-journal（上次写到一半）'
+  }
+  $final = if ([string]::IsNullOrWhiteSpace($why)) { $detail } else { "$detail   ← $why" }
+  [pscustomobject]@{ Exists = $true; Bad = $bad; Detail = $final }
+}
+
 
 # ---------------- 输出 ----------------
 function Say($m)  { Write-Host $m }
@@ -133,6 +182,14 @@ function Get-Snapshots {
     Sort-Object Name -Descending
 }
 
+# 短命令是否已装进 PowerShell profile
+function Test-ShortInstalled {
+  try {
+    $t = Get-Content $PROFILE -Raw -ErrorAction Stop
+    return [bool]($t -and $t.Contains('# >>> dsh-rescue >>>'))
+  } catch { return $false }
+}
+
 function New-Snapshot {
   param([string]$Reason = 'manual')
   $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -200,7 +257,22 @@ function Show-Status {
   Say ("最近快照      : " + $(if ($snaps.Count -gt 0) { $snaps[0].Name } else { '无' }))
   $logs = @(Get-CrashLogs)
   Say ("最近崩溃日志  : " + $(if ($logs.Count -gt 0) { "$($logs[0].Name) @ $($logs[0].LastWriteTime)" } else { '无' }))
-  Say ""
+  $ck = Get-CookieReport
+  if ($ck.Bad) { Bad "登录态        : $($ck.Detail)" }
+  else { Say "登录态        : $($ck.Detail)" }
+
+  Say ''
+  Say '下一步（按情况挑一条，直接粘）：'
+  if (Test-ShortInstalled) {
+    Say '  看不清问题   : dsh-rescue diagnose'
+    Say '  要留还原点   : dsh-rescue snapshot'
+    Say '  不知道怎么办 : dsh-rescue help'
+  } else {
+    Say "  看不清问题   : pwsh -File `"$PSCommandPath`" diagnose"
+    Say "  要留还原点   : pwsh -File `"$PSCommandPath`" snapshot"
+    Say "  嫌命令太长   : pwsh -File `"$PSCommandPath`" install   （装一次，之后敲 dsh-rescue）"
+  }
+  Say ''
 }
 
 # ---------------- diagnose ----------------
@@ -245,12 +317,18 @@ function Show-Diagnose {
     Warn '这份日志是旧账。若应用现在能起来，说明已经修过；真正的当前问题看下一次崩溃。'
   }
 
-  $head = Get-Content $latest.FullName -TotalCount 400
+  $head = @(Get-Content $latest.FullName -TotalCount 400)
 
-  $fatal = $head | Select-String -Pattern 'startup failed|DesktopHostFatalError|did not activate' | Select-Object -First 2
-  if ($fatal) {
-    $fatal | ForEach-Object { Bad ($_.Line.Trim()) }
+  # 取 --- error --- 后面第一行非空内容：这是唯一能用来分型的依据
+  $errLine = ''
+  $mark = -1
+  for ($i = 0; $i -lt $head.Count; $i++) { if ($head[$i].Trim() -eq '--- error ---') { $mark = $i; break } }
+  if ($mark -ge 0) {
+    for ($i = $mark + 1; $i -lt $head.Count; $i++) {
+      if ($head[$i].Trim()) { $errLine = $head[$i].Trim(); break }
+    }
   }
+  if ($errLine) { Bad $errLine } else { Warn '这份日志里没有 --- error --- 段' }
 
   $missing = @($head | Select-String -Pattern '^\s{2}\S+\s+\(required\)' |
     ForEach-Object { $_.Line.Trim() } | Select-Object -Unique)
@@ -262,7 +340,7 @@ function Show-Diagnose {
   Say ""
   Step '判断'
   $bundles = @(Get-Bundles $json)
-  $errText = (@($fatal) | ForEach-Object { $_.Line }) -join ' '
+  $errText = $errLine
 
   if ($errText -match 'did not activate') {
     # 甲类：装载树没起来（基础 bundle 层未应用）
@@ -287,6 +365,20 @@ function Show-Diagnose {
     Say '    2) 回退到上一个良好快照的依赖树（restore -Snapshot <名字>，它会用 lockfile 冻结版本）'
     Say '    3) 若仍失败：手动删 node_modules，再按良好 lockfile 重装'
     Say '    4) 在问题查清前，别往 profile 里再装 link: 依赖'
+  }
+  elseif ($errText -match 'Web authentication failed' -or $errText -match 'connectDesktopWelcome') {
+    # 丙类：登录态坏了 —— 与 profile 无关，别动配置
+    Say '  丙类故障：应用登录态失效（desktop welcome: Web authentication failed）。'
+    Say '  这跟插件、profile 配置、node_modules 一点关系都没有，动它们只会白丢配置。'
+    Say '  真凶是应用数据目录里的 Cookies（Electron 的登录态 SQLite）。'
+    $ck = Get-CookieReport
+    Say ("  当前 Cookies：$($ck.Detail)")
+    if ($ck.Bad) { Bad '  ← 已经能看出它坏了' }
+    Say ''
+    Say '  正确做法（应用要完全退出，含托盘）：'
+    Say '    pwsh -File dsh-rescue.ps1 reset-cookies'
+    Say '  这条会把 Cookies / Cookies-journal 改名成 .bak-时间戳（不是删除，可回退），'
+    Say '  然后重启应用，重新登录一次即可。'
   }
   else {
     Say '  错误类型没有命中已知模式。先 snapshot 保底，再人工看日志里第一段 --- error ---。'
@@ -466,38 +558,98 @@ function Invoke-Rollback {
   Warn '配置文件已回滚；node_modules 未变动。若依赖也需要对齐，跑 restore 或重新 install。'
 }
 
+# ---------------- reset-cookies ----------------
+function Invoke-ResetCookies {
+  Assert-AppClosed
+  $files = @(Get-CookieFiles)
+  if ($files.Count -eq 0) {
+    Warn "在 $AppDataRoot 里没找到 Cookies 文件，无需处理（下次启动会重新登录）"
+    return
+  }
+  $ck = Get-CookieReport
+  Step "应用数据目录：$AppDataRoot"
+  Say "  当前：$($ck.Detail)"
+
+  $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+  foreach ($f in $files) {
+    $dest = "$($f.FullName).bak-$stamp"
+    Move-Item $f.FullName $dest -Force
+    Ok "已改名：$($f.Name) → $(Split-Path $dest -Leaf)"
+  }
+
+  Say ''
+  Say '下一步：启动 DeepSeek Harness，会要求重新登录一次。' -ForegroundColor Yellow
+  Say "要退回：把上面那些 .bak-$stamp 改回原名即可（没有删除任何东西）。" -ForegroundColor Yellow
+}
+
+# ---------------- install（把短命令写进 PowerShell profile） ----------------
+function Invoke-Install {
+  $scriptPath = $PSCommandPath
+  if ([string]::IsNullOrWhiteSpace($scriptPath) -or -not (Test-Path $scriptPath)) {
+    throw '拿不到脚本自身路径，无法安装短命令。'
+  }
+  $prof = $PROFILE
+  $dir = Split-Path $prof -Parent
+  if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+
+  $begin = '# >>> dsh-rescue >>>'
+  $end = '# <<< dsh-rescue <<<'
+  $block = "$begin`r`nfunction dsh-rescue { & '$scriptPath' @args }`r`n$end"
+
+  $existing = if (Test-Path $prof) { Get-Content $prof -Raw } else { '' }
+  if ($existing -and $existing.Contains($begin)) {
+    $pattern = '(?s)' + [regex]::Escape($begin) + '.*?' + [regex]::Escape($end)
+    $updated = [regex]::Replace($existing, $pattern, $block)
+    Set-Content -Path $prof -Value $updated -NoNewline -Encoding utf8NoBOM
+    Ok "已更新 $prof 里的 dsh-rescue"
+  } else {
+    Add-Content -Path $prof -Value "`r`n$block" -Encoding utf8NoBOM
+    Ok "已把 dsh-rescue 写进 $prof"
+  }
+
+  Say ''
+  Say '重开一个终端（或先执行 . $PROFILE），之后就可以直接用：' -ForegroundColor Yellow
+  Say '  dsh-rescue diagnose' -ForegroundColor Yellow
+  Say '  dsh-rescue snapshot' -ForegroundColor Yellow
+}
+
 # ---------------- 分发 ----------------
+if ([string]::IsNullOrWhiteSpace($Command)) { $Command = 'status' }
+
 if ($Command -eq 'help') {
   Say @'
-DSH 桌面端急救工具
+DSH 急救 · dsh-rescue
 
-  status     看现状（只读）
-  diagnose   读最新崩溃日志 + 校验配置（只读，先跑这个）
-  snapshot   手动备份一次当前配置
-  minimal    退到最小可启动配置（起不来时用这招先救活）
-  restore    还原良好依赖清单 + patch，并 pnpm install（有 lockfile 则冻结安装）
-  rollback   把快照写回（默认最近一份，可用 -Snapshot 指定）
+  status         看现状（只读）
+  diagnose       看最新崩溃日志、判定故障类型（只读，先跑这个）
+  snapshot       手动留一个还原点
+  minimal        甲类用：退到最小可启动配置
+  restore        装回良好依赖 + patch（有 lockfile 则冻结安装）
+  rollback       把快照写回（默认最近一份，会列出所有快照）
+  reset-cookies  丙类用：登录态坏了，把 Cookies 改名（不删除，可回退）
+  install        把短命令 dsh-rescue 写进 PowerShell profile
 
 参数：
   -ProfileDir <路径>   默认 ~/.dsh/profiles/desktop
-  -Snapshot <名字>     rollback / restore 时指定用哪份快照
-                       例：restore -Snapshot auto-20260101-120000
+  -Snapshot <名字>     restore / rollback 时指定用哪份快照
+  -AppDataDir <路径>   默认 %APPDATA%\@deepseek-ai\dsh-desktop
   -Force               应用在运行中也继续（不推荐）
 
-典型流程：
-  起不来  → diagnose → 按诊断结果选分支
-  甲类（did not activate）      → minimal → 启动确认 → restore
-  乙类（Host 读字段失败）        → restore -Snapshot <上一个良好快照>
-  装回去崩 → rollback
+三步：
+  1. dsh-rescue diagnose          ← 永远先做这个
+  2. 按它说的抄一条命令
+  3. 重启应用；起不来就 dsh-rescue rollback
 '@
   return
 }
 
 switch ($Command) {
-  'status'   { Show-Status }
-  'diagnose' { Show-Diagnose }
-  'snapshot' { $d = New-Snapshot -Reason 'manual'; Ok "已备份：$d" }
-  'minimal'  { Invoke-Minimal }
-  'restore'  { Invoke-Restore }
-  'rollback' { Invoke-Rollback }
+  'status'        { Show-Status }
+  'diagnose'      { Show-Diagnose }
+  'snapshot'      { $d = New-Snapshot -Reason 'manual'; Ok "已备份：$d" }
+  'minimal'       { Invoke-Minimal }
+  'restore'       { Invoke-Restore }
+  'rollback'      { Invoke-Rollback }
+  'reset-cookies' { Invoke-ResetCookies }
+  'install'       { Invoke-Install }
 }
